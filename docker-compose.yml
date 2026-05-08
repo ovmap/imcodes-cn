@@ -1,13 +1,13 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg18
+    image: docker.m.daocloud.io/pgvector/pgvector:pg18
     restart: unless-stopped
     environment:
       POSTGRES_DB: imcodes
       POSTGRES_USER: imcodes
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U imcodes -d imcodes"]
       interval: 5s
@@ -38,8 +38,10 @@ services:
         condition: service_healthy
 
   caddy:
-    image: caddy:2-alpine
+    image: docker.m.daocloud.io/caddy:2-alpine
     restart: unless-stopped
+    env_file:
+      - .env
     ports:
       - "80:80"
       - "443:443"
@@ -52,7 +54,7 @@ services:
       - server
 
   watchtower:
-    image: nickfedor/watchtower
+    image: docker.m.daocloud.io/nickfedor/watchtower:latest
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
