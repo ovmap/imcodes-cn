@@ -1,6 +1,6 @@
-# [IM.codes](https://im.codes)
+# [IM.codes](https://imc.ovmap.cn)
 
-[English](../README.md) | [簡體中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.en.md) | [簡體中文](../README.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
 **給 AI agent 的 IM。共享記憶、受監督執行，以及跨模型審計。**
@@ -64,7 +64,7 @@ IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會�
 
 当你离开电脑时，大多数 coding-agent 工作流都会断掉。agent 仍然在终端里运行，但继续工作通常意味着 SSH、tmux attach、远程桌面，或者只能等你回到电脑前。
 
-[IM.codes](https://im.codes) 让这些会话在手機或網頁上也始终可达：打开终端、检查文件和 Git 變更、在其他设备上預覽 localhost、在任务完成时收到通知，并继续调度多个 agent。
+[IM.codes](https://imc.ovmap.cn) 让这些会话在手機或網頁上也始终可达：打开终端、检查文件和 Git 變更、在其他设备上預覽 localhost、在任务完成时收到通知，并继续调度多个 agent。
 
 它不是另一个 AI IDE，也不是普通的遠端終端。它是围绕终端型 coding agent 的消息与控制层。
 

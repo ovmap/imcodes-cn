@@ -1,6 +1,6 @@
-# [IM.codes](https://im.codes)
+# [IM.codes](https://imc.ovmap.cn)
 
-[English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.en.md) | [简体中文](../README.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 **エージェントのための IM。共有メモリ、監督付き実行、そして AI プロバイダー横断の監査。**
 
@@ -62,7 +62,7 @@ iPhone、iPad、Apple Watch に対応しています。[Web App](https://app.im.
 
 デスクを離れると、多くの coding-agent workflow は途切れます。agent は端末で動き続けていても、続きの操作には SSH、`tmux attach`、リモートデスクトップなどが必要になります。
 
-[IM.codes](https://im.codes) はそうした session をモバイルや Web から手の届く場所に保ちます。ターミナルを開き、ファイルや Git 変更を確認し、別デバイスで localhost をプレビューし、作業完了時に通知を受け取り、複数の agent を並行して動かせます。
+[IM.codes](https://imc.ovmap.cn) はそうした session をモバイルや Web から手の届く場所に保ちます。ターミナルを開き、ファイルや Git 変更を確認し、別デバイスで localhost をプレビューし、作業完了時に通知を受け取り、複数の agent を並行して動かせます。
 
 これは別の AI IDE ではなく、単なる遠隔ターミナルでもありません。端末ベースの coding agents を取り巻くメッセージング / 制御レイヤーです。
 

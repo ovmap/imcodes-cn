@@ -1,6 +1,6 @@
-# [IM.codes](https://im.codes)
+# [IM.codes](https://imc.ovmap.cn)
 
-[English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.en.md) | [简体中文](../README.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 **에이전트를 위한 IM. 공유 메모리, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.**
 
@@ -62,7 +62,7 @@ iPhone, iPad, Apple Watch를 지원합니다. [Web App](https://app.im.codes) �
 
 자리를 비우면 대부분의 coding-agent workflow가 끊깁니다. agent는 터미널에서 계속 실행되지만, 이어서 작업하려면 SSH, `tmux attach`, 원격 데스크톱 등이 필요합니다.
 
-[IM.codes](https://im.codes)는 그런 session을 모바일과 웹에서 계속 다룰 수 있게 합니다. 터미널을 열고, 파일과 Git 변경을 보고, 다른 기기에서 localhost를 미리보고, 작업 완료 알림을 받고, 여러 agent를 계속 움직일 수 있습니다.
+[IM.codes](https://imc.ovmap.cn)는 그런 session을 모바일과 웹에서 계속 다룰 수 있게 합니다. 터미널을 열고, 파일과 Git 변경을 보고, 다른 기기에서 localhost를 미리보고, 작업 완료 알림을 받고, 여러 agent를 계속 움직일 수 있습니다.
 
 이것은 또 다른 AI IDE도 아니고 단순 원격 터미널도 아닙니다. 터미널 기반 coding agent 위에 놓이는 메시징 / 제어 레이어입니다.
 

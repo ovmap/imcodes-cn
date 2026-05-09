@@ -1,6 +1,6 @@
-# [IM.codes](https://im.codes)
+# [IM.codes](https://imc.ovmap.cn)
 
-[English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](README.en.md) | [简体中文](../README.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
 **El IM para agentes. Memoria compartida, ejecución supervisada y auditoría cruzada entre proveedores de IA.**
@@ -64,7 +64,7 @@ Compatible con iPhone, iPad y Apple Watch. También disponible como [web app](ht
 
 Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en un terminal, pero continuar normalmente implica SSH, `tmux attach`, escritorios remotos o esperar hasta volver al portátil.
 
-[IM.codes](https://im.codes) mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura.
+[IM.codes](https://imc.ovmap.cn) mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura.
 
 No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de mensajería y control alrededor de coding agents basados en terminal.
 

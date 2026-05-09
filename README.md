@@ -1,142 +1,130 @@
-# [IM.codes](https://im.codes)
+# [IM.codes](https://imc.ovmap.cn)
 
-[English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
+[English](README.i18n/README.en.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.**
 
-IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+**给 AI agent 的 IM。共享记忆、受监督执行，以及跨模型审计。**
 
-> **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
+IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，同时提供终端访问、文件浏览、Git 视图、localhost 预览、通知、多 agent 工作流，以及 transport 型 agent 的原生流式输出。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。内置 P2P 讨论功能，让多个模型相互审阅对方的方案和实现，能有效减少单模型的遗漏、盲点和偏差。
 
-### Breaking Changes
+> **说明：** 本文件是中文版。**英文版（`README.i18n/README.en.md`）是规范版本。** 若内容存在差异，以英文版为准。
 
-- **PostgreSQL default image changed to `pgvector/pgvector:pg18`** (instead of `postgres:16-alpine`). New self-hosted deployments generated from the current templates use this image for multilingual vector search in shared agent memory:
-  ```yaml
-  postgres:
-    image: pgvector/pgvector:pg18   # was: postgres:16-alpine
-  ```
-  The pgvector extension is enabled automatically by the server migration on first startup.
+支持多个 agent 通过 CLI 和 SDK 两种方式接入。
 
-## Screenshots
+## 截图
 
-### Desktop
+### 桌面端
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-sidebar.png"><img src="landing/imcodes-sidebar.png" width="24%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="landing/imcodes0.png" width="24%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="landing/imcodes1.png" width="24%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="landing/imcodes2.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-sidebar.png"><img src="../landing/imcodes-sidebar.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="../landing/imcodes0.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="../landing/imcodes1.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="../landing/imcodes2.png" width="24%" /></a>
 </p>
 
-### iPad / Tablet
+### iPad / 平板
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad2.png"><img src="landing/imcodes-ipad2.png" width="48%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="landing/imcodes-ipad3.png" width="48%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad2.png"><img src="../landing/imcodes-ipad2.png" width="48%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="../landing/imcodes-ipad3.png" width="48%" /></a>
 </p>
 
-### Mobile
+### 手机
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="landing/imcodes-m6.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="landing/imcodes-m7.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="landing/imcodes-m8.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="landing/imcodes-m5.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="landing/imcodes-m1.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="landing/imcodes-m2.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="landing/imcodes-m3.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="landing/imcodes-m4.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="../landing/imcodes-m6.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="../landing/imcodes-m7.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="../landing/imcodes-m8.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="../landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="../landing/imcodes-m1.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="../landing/imcodes-m2.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="../landing/imcodes-m3.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="../landing/imcodes-m4.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="../landing/imcodes-m0.png" width="18%" /></a>
 </p>
 
 ### Apple Watch
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch1.png"><img src="landing/imcodes-watch1.png" width="31%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch0.png"><img src="landing/imcodes-watch0.png" width="31%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch2.png"><img src="landing/imcodes-watch2.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch1.png"><img src="../landing/imcodes-watch1.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch0.png"><img src="../landing/imcodes-watch0.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch2.png"><img src="../landing/imcodes-watch2.png" width="31%" /></a>
 </p>
 
-Watch support covers quick session monitoring, unread counts, push notifications, and quick replies directly from the wrist.
 
-## Download
+手表支持会话快速查看、未读计数、推送通知，以及直接在手腕上快速回复。
+
+## 下载
 
 <a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
 
-Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes).
+支持 iPhone、iPad 和 Apple Watch。也可以通过 [Web App](https://app.im.codes) 使用。
 
-## Why
+## 为什么做这个
 
-When you leave your desk, most coding-agent workflows fall apart. The agent is still running in a terminal, but continuing the work usually means SSH, tmux attach, remote desktop hacks, or waiting until you're back at your laptop.
+当你离开电脑时，大多数 coding-agent 工作流都会断掉。agent 仍然在终端里运行，但继续工作通常意味着 SSH、tmux attach、远程桌面，或者只能等你回到电脑前。
 
-[IM.codes](https://im.codes) keeps those sessions within reach from mobile or web: open the terminal, inspect files and git changes, preview localhost from another device, get notified when work finishes, and keep multiple agents moving on your own infrastructure.
+[IM.codes](https://imc.ovmap.cn) 让这些会话在手机或网页上也始终可达：打开终端、检查文件和 Git 变更、在其他设备上预览 localhost、在任务完成时收到通知，并继续调度多个 agent。
 
-It is not another AI IDE or a generic remote terminal. It is the messaging/control layer around terminal-based coding agents.
+它不是另一个 AI IDE，也不是普通的远程终端。它是围绕终端型 coding agent 的消息与控制层。
 
-This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+这是一个个人项目。我自己几乎没写代码——它基本由 [Claude Code](https://github.com/anthropics/claude-code) 构建完成，[Codex](https://github.com/openai/codex) 和 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 也提供了大量贡献。
 
-## Shared Agent Context & Memory
+## 共享代理上下文与记忆
 
-IM.codes continuously turns completed agent work into reusable memory and feeds that context back into future sessions.
+IM.codes 会持续把已完成的代理工作沉淀成可复用记忆，并在后续会话中自动回灌这些上下文。
 
-- **Problem → solution memory, not log spam.** Only final `assistant.text` outputs are materialized. Streaming deltas, tool calls, and intermediate noise are excluded.
-- **Personal memory with optional cloud sync.** Raw and processed memory always stay local; processed summaries can optionally sync to a user-scoped cloud pool shared across your devices.
-- **Enterprise shared context.** Teams can publish reusable memory into workspace/project scopes, inspect it in the UI, query it, and see stats instead of treating context as hidden prompt text. This part is still under active development and has not been fully production-tested yet.
-- **Multilingual recall.** Local semantic search and server-side pgvector recall use multilingual embeddings, so related fixes can be found across English, Chinese, Japanese, Korean, Spanish, Russian, and mixed-language repos.
-- **Automatic injection where it matters.** Relevant past work is injected both per-message and at session startup, with timeline cards that show what was recalled, why, the relevance score, recall count, and last-used time.
-- **User-visible inspection and control.** Shared Context UI separates raw events, processed summaries, cloud memory, and enterprise memory, with query, preview, archive/restore, and processing configuration controls.
+- **保存的是问题 → 解决方案，不是日志噪音。** 只有最终 `assistant.text` 会进入记忆；流式 delta、tool call、tool result 和中间噪音都会被排除。
+- **个人记忆支持可选云同步。** 原始和处理后的记忆始终保留在本地；处理后的摘要可以按需同步到用户级云端池，在多台设备之间共享。
+- **企业共享上下文可查询、可检查。** 团队可以把经验发布到 workspace/project 作用域，在 UI 里查询、查看统计，而不是把上下文藏在不可见的 prompt 里。这部分仍在持续开发中，还没有经过完整的生产级测试。
+- **多语言召回。** 本地语义搜索和基于 pgvector 的服务端召回使用多语言 embedding，可以跨中英日韩西俄等语言找到相关修复经验。
+- **按消息和按会话启动自动注入。** 相关历史会在发送消息前和 session 启动时自动注入，并通过 timeline 卡片显示召回内容、原因、相关性分数、召回次数和最后使用时间。
+- **用户可见、可控。** Shared Context UI 分离 raw events、processed summaries、cloud memory 和 enterprise memory，并提供查询、预览、archive/restore 与处理配置控制。
 
-## Supervised Execution & Auto Audit
+## 受监督执行与 Auto Audit
 
-IM.codes can drive supported agent sessions turn by turn — a supervisor with your own instructions evaluates each completed turn at the idle boundary and decides to auto-continue, hand back, or trigger an audit loop, instead of you typing "continue" every round.
+IM.codes 可用你自己的 supervisor 提示词对支持的 agent session 做逐轮驱动 —— 每一轮 idle 边界上结构化判定是 auto-continue、交还给你，还是触发一次 audit 闭环，而不是让你每轮手动打 "continue"。
 
-- **Per-session Auto modes.** Configure `off`, `supervised`, or `supervised_audit` per session instead of forcing one policy everywhere.
-- **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
-- **Fail-closed automation.** Auto supervision stays visible in the timeline/footer, uses structured decisions, and returns control to you on timeout, invalid output, or bad config instead of silently guessing.
-- **Optional audit → rework loop.** In `supervised_audit`, a completed turn can automatically enter an audit pipeline and send a rework brief back into the same session before control returns.
-- **Global defaults seed new sessions.** Set your default supervisor backend, model, and timeout once. New `supervised` / `supervised_audit` sessions snapshot them at enable time, and each session can still override backend/model/timeout and audit mode individually.
-- **Two-layer custom supervision instructions.** Keep a global supervision persona alongside a per-session addition. By default the two are concatenated (`global`, blank line, then `session`); tick the session's **Override global** checkbox to ignore the global value for that one session. Unlike backend/model/timeout, the global value is re-read on every dispatch, so editing it takes effect on already-enabled sessions without a re-enable.
-- **Built for real IM.codes workflows.** Auto supervision understands OpenSpec work, P2P discussion/review flows, and `imcodes send`-style cross-agent coordination as valid agent actions, not immediate reasons to stop for a human.
+- **按 session 配置 Auto 模式。** 可以为每个 session 单独设置 `off`、`supervised` 或 `supervised_audit`，而不是对所有会话强行使用同一套策略。
+- **在 idle 边界做完成判定。** 当一轮完成后，IM.codes 会把结果判成 `complete`、`continue` 或 `ask_human`，并把后续 continue prompt 直接发回同一 session。
+- **失败即回退的自动化。** Auto supervision 会保持在 timeline/footer 中可见，使用结构化判定，并在超时、输出无效或配置错误时把控制权还给你，而不是默默猜测。
+- **可选的 audit → rework 闭环。** 在 `supervised_audit` 中，已完成的回合可自动进入审计流程，并在交还控制权前把返工 brief 发回同一 session。
+- **全局默认值 + 单 session 覆盖。** 你可以先设置默认的 supervisor backend/model/timeout，再按需在某个 session 上覆盖 backend/model/timeout、审计模式和自定义提示词。
+- **理解 IM.codes 原生工作流。** Auto supervision 会把 OpenSpec 工作流、P2P 讨论/评审流程，以及 `imcodes send` 式的 agent 协作视为正常下一步，而不是立即停下来要求人工介入。
 
-## Features
+## 功能
 
-### Remote Terminal
+### 远程终端
 
-Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming at 12fps with zero message limits.
+可以从任意浏览器完整访问 agent 会话终端——无需 SSH、VPN 或端口转发。支持原始终端模式（原生 CLI 体验）与结构化聊天视图（解析工具调用、thinking block 和流式输出）之间切换。实时 PTY 流以 12fps 更新，没有消息条数限制。
 
-### File Browser & Git Changes
+### 文件浏览与 Git 变更
 
-Browse project files with a tree view. Upload files, images, and photos from any device — download files directly from the server. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
+用树形结构浏览项目文件。可以从任意设备上传文件、图片和照片，也可以直接从服务器下载文件。Changes 标签页显示 git status，并给出每个文件彩色的 `+新增` / `-删除` 行数。点击文件可打开悬浮预览窗口，支持语法高亮、diff 视图和每 5 秒自动刷新。文件浏览器还可以固定到侧边栏，并自动跟随当前活动标签的项目目录。
 
-### Local Web Preview
+### 本地 Web 预览
 
-Preview your local dev server from any device — phone, tablet, or remote browser — without deploying. The daemon proxies `localhost` traffic through a secure WebSocket tunnel to the server. HTML rewriting and a runtime patch handle URL remapping so links, fetch, and WebSocket connections just work. Supports HMR/hot-reload via WebSocket tunneling. No public URLs, no third-party tunnels — traffic stays within your IM.codes server.
+可以在手机、平板或远端浏览器上预览你本机的开发服务器，而无需部署。daemon 会通过安全的 WebSocket 隧道把 `localhost` 流量代理到服务器。HTML 重写和运行时补丁会处理 URL 映射，使链接、fetch 和 WebSocket 都能正常工作。支持通过 WebSocket 隧道实现 HMR / 热更新。不需要公开 URL，也不依赖第三方隧道——流量只在你自己的 IM.codes 服务器中转。
 
-### Mobile, Watch & Notifications
+### 移动端、手表与通知
 
-Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
+完整支持移动端，包含生物识别认证和推送通知。Shell 会话在手机上也支持交互式键盘输入（类似 SSH）。子会话预览卡始终显示最新消息。Toast 通知可直接跳转到对应会话。Apple Watch 支持会话快速查看、未读计数和快速回复。
 
-### Supervised Task Automation
+### 跨模型审计与 P2P 讨论
 
-Auto supervision adds turn-level control for supported transport-backed agents. Instead of blindly continuing forever, IM.codes evaluates the latest completed turn and decides whether the task looks done, should keep going, or should come back to you. For higher-assurance work, `supervised_audit` can automatically trigger an audit/rework loop before the session is considered finished.
+单模型输出不应被盲目信任。P2P 讨论让多个 agent——跨不同 provider 和思维风格——在写代码之前就对同一代码库进行协作分析。每轮遵循可自定义的多阶段流程，每个 agent 读取所有前序贡献并在此基础上输出。不同模型捕获不同类别的问题：一个发现竞态条件，另一个指出遗漏的 migration，第三个质疑 API 设计。这种跨 provider 交叉审查能在实现前发现绝大部分问题，大幅减少返工。
 
-Auto supervision splits configuration into two layers. Backend, model, and timeout are **snapshot-frozen** at the moment you enable Auto on a session, so editing the global defaults later never surprises an already-running session. Custom supervision instructions work differently: a **global persona** is paired with the session's own free text and — by default — both are concatenated into the prompt sent to the supervisor. Tick the session's **Override global** checkbox to have that session ignore the global persona entirely. The global persona is re-read on every turn, so when you update it every already-enabled session picks it up on the next dispatch without needing a re-enable. Auto is also aware of IM.codes-native workflows such as OpenSpec changes, P2P discussions, and `imcodes send`, so those actions count as legitimate next steps instead of accidental "ask human" triggers.
+内置模式包括 `audit`（结构化 audit → review → plan 流水线）、`review`、`discuss` 和 `brainstorm`，也可以自定义阶段序列。侧边栏中的环形进度条会显示 round / hop 完成情况。支持 Claude Code、Codex、Gemini CLI 和 Qwen，也兼容带 sandbox 的 agent。通过 `@@all(config)` 或 UI 配置参与者、轮次、模式和 P2P 设置。
 
-### Multi-Agent Discussions & Cross-Provider Audit
+### 流式 Transport Agents
 
-Single-model output shouldn't be trusted blindly. P2P discussions let multiple agents — across different providers and thinking styles — collaborate on the same codebase before a single line is written. Each round follows a customizable multi-phase pipeline where every agent reads all prior contributions and builds on them. Different models catch different classes of issues: one spots a race condition, another flags a missing migration, a third questions the API design. This cross-provider scrutiny catches the majority of problems before implementation, dramatically reducing rework cycles.
+对 [OpenClaw](https://openclaw.com) 和 [Qwen](https://github.com/QwenLM/qwen-agent) 这类 transport 型 agent，提供原生流式输出支持。这些 agent 通过网络协议（WebSocket 或本地 SDK）连接，而不是通过终端抓取，从而能提供实时 delta 更新、工具调用跟踪和会话恢复。
 
-Built-in modes include `audit` (structured audit → review → plan pipeline), `review`, `discuss`, and `brainstorm` — or define your own phase sequence. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, Gemini CLI, and Qwen, including sandboxed agents. Configure participants, round counts, modes, and per-session P2P settings via `@@all(config)` or the UI.
+> **OpenClaw 说明：** `imcodes connect openclaw` 目前只在 macOS 上验证过。
 
-### Streaming Transport Agents
+### Agent 到 Agent 通信
 
-Native streaming output support for transport-backed agents like [Claude Code SDK](https://github.com/anthropics/claude-agent-sdk-typescript), [Codex SDK](https://github.com/openai/codex/tree/main/sdk/typescript), [OpenClaw](https://openclaw.com), and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols or local SDKs instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
-
-> **Note on OpenClaw:** `imcodes connect openclaw` has only been tested on macOS so far.
-
-### Agent-to-Agent Communication
-
-Agents can message each other directly using `imcodes send`. An agent running in one session can ask a sibling to review code, run tests, or coordinate on a task — no user intervention needed. Target resolution by label, session name, or agent type. `--reply` flag instructs the target to send its response back automatically. Built-in circuit breakers prevent abuse (depth limit, rate limiting, broadcast cap).
+agent 可以通过 `imcodes send` 直接互相发送消息。一个会话中的 agent 可以请求另一个兄弟会话去 review 代码、跑测试或协同处理任务——无需用户手动中转。支持按 label、session 名或 agent 类型解析目标。`--reply` 参数会要求对方自动把结果发回。内置了防滥用的保护：深度限制、速率限制和广播上限。
 
 ```bash
 imcodes send "Plan" "review the changes in src/api.ts"
@@ -144,7 +132,7 @@ imcodes send "Cx" "run tests" --reply
 imcodes send --all "migration complete, check your end"
 ```
 
-Beyond agent-to-agent chat, you can use `script` sessions to build custom automation. A Python script running in a script session can call `imcodes send` to trigger agents based on any external event:
+除了 agent-to-agent 聊天，你还可以使用 `script` 会话构建自定义自动化。一个运行在 script 会话中的 Python 脚本可以调用 `imcodes send`，根据任意外部事件触发 agent：
 
 ```python
 # monitor.py — watch a log file, trigger agent when errors appear
@@ -156,7 +144,8 @@ while True:
             if "ERROR" in line:
                 subprocess.run([
                     "imcodes", "send", "Claude",
-                    f"Fix this error and write the patch to /tmp/fix.patch:\n{line}"
+                    f"Fix this error and write the patch to /tmp/fix.patch:
+{line}"
                 ])
     time.sleep(30)
 ```
@@ -170,52 +159,53 @@ curl -X POST https://your-server/webhook -d '{"pr": 42}' \
 imcodes send "Claude" "tests failed on main, check CI log at /tmp/ci.log and fix" --reply
 ```
 
-Use cases: log monitoring → auto-fix, webhook-triggered code review, CI failure auto-diagnosis, scheduled data pipeline checks, custom approval workflows with output written to specific files for human review.
-### @ Picker — Smart Agent & File Selection
+适用场景包括：日志监控自动修复、Webhook 触发代码评审、CI 失败自动诊断、定时数据管道检查，以及需要把结果写入指定文件供人工审批的自定义工作流。
 
-Type `@` to search project files, `@@` to select agents for P2P dispatch. `@@all(config)` sends to all configured agents with saved per-session P2P settings (mode, rounds, participants). Custom round counts via `@@all+`. The picker integrates with the structured WS routing — daemon handles all expansion, frontend stays clean.
+### @ 选择器——智能 Agent 与文件选择
 
-### Multi-Server, Multi-Session Management
+输入 `@` 搜索项目文件，输入 `@@` 选择 agent 用于 P2P 分发。`@@all(config)` 会按照当前会话保存的 P2P 设置（模式、轮数、参与者）发送给所有已配置 agent。通过 `@@all+` 可以自定义轮数。前端只负责选择，具体展开由 daemon 通过结构化 WS 路由完成。
 
-Connect multiple dev machines to one dashboard. Each machine runs a lightweight daemon that manages local agent sessions via tmux. See all servers and sessions at a glance — start, stop, restart, or switch between them instantly. Sub-sessions let you spawn additional agents from within a running session for parallel tasks. Draggable tabs with pin support and right-click context menus.
+### 多服务器、多会话管理
 
-### Discord-Style Sidebar
+你可以把多台开发机接到同一个面板里。每台机器运行一个轻量 daemon，通过 tmux 管理本地 agent 会话。你可以在一个界面里查看所有 server 和 session，并即时启动、停止、重启或切换。Sub-session 允许你在运行中的主会话内部再启动更多 agent 来并行处理任务。支持可拖拽标签、固定和右键菜单。
 
-Server icon bar for instant multi-server switching. Hierarchical session tree with collapsible sub-sessions, unread message badges, and idle flash animation when agents finish tasks. Pin any floating window (file browser, repository, sub-session chat) to the sidebar for persistent access. Language switcher and build info at the bottom.
+### Discord 风格侧边栏
 
-### Pinnable Panels
+支持 server 图标栏快速切换服务器。层级式会话树支持折叠 sub-session、未读消息徽标，以及 agent 完成任务时的 idle 闪烁动画。任意悬浮窗口（文件浏览器、仓库页、子会话聊天）都可以固定到侧边栏。语言切换器和构建信息在底部。
 
-Drag any floating window to the sidebar to pin it as a persistent panel. Supports file browser, repository page, sub-session chat, and terminal views. Panels are resizable, server-synced (cross-device), and auto-recover on reconnect. Generic registry — new panel types register in one file.
+### 可固定面板
 
-### Repository Dashboard
+任何悬浮窗口都可以拖到侧边栏并固定为常驻面板。支持文件浏览器、仓库页面、子会话聊天和终端视图。面板可调整大小、通过服务器同步到多设备，并在重连后自动恢复。底层是通用注册机制，新面板类型只需在一个文件里注册。
 
-View issues, pull requests, branches, commits, and CI/CD runs directly in the app. Silent background refresh — no more pull-to-refresh jitter. CI status auto-polls (10s when running, 15s otherwise). Pin the repository page to the sidebar for always-on visibility.
+### 仓库看板
 
-### Scheduled Tasks (Cron)
+可以直接在应用里查看 issue、pull request、branch、commit 和 CI/CD 运行状态。后台静默刷新，不会出现下拉刷新抖动。CI 状态自动轮询（运行中每 10 秒，否则每 15 秒）。仓库页面也可以固定到侧边栏，常驻显示。
 
-Automate recurring agent workflows with cron-style scheduling. Create scheduled tasks that send commands to specific sessions or trigger multi-agent P2P discussions on a timetable. Visual cron picker for common intervals, timezone-aware scheduling, and manual "Run Now" for testing. Execution history with expandable result detail — click any record to navigate to the target session and quote the result for follow-up. Cross-job execution list with Latest/All modes and multi-server filtering.
+### 定时任务（Cron）
 
-### Cross-Device Sync
+支持以 cron 风格自动化重复性的 agent 工作流。你可以创建定时任务，按时间表向某个 session 发送命令，或触发多 agent 的 P2P 讨论。提供常见周期的可视化 cron 选择器、时区感知调度，以及用于调试的“立即运行”。执行历史支持展开查看详情，点击任何记录都可以跳转到目标会话并引用结果继续跟进。还支持跨任务执行列表的 Latest / All 模式和多服务器筛选。
 
-Tab order, pinned tabs, and pinned sidebar panels sync across devices via the server preferences API. Write-through cache pattern: localStorage for instant render, debounced server PUT for cross-device consistency. Timestamped payloads for conflict resolution. Device-specific state (sidebar width, panel heights, view mode) stays local.
+### 跨设备同步
 
-### Internationalization
+标签顺序、固定标签和固定侧边栏面板会通过服务器偏好 API 在多设备之间同步。采用写穿缓存模式：本地 localStorage 用于即时渲染，服务器端使用防抖 PUT 以保证跨设备一致性。通过带时间戳的 payload 解决冲突。设备特有状态（侧边栏宽度、面板高度、视图模式）仍然保留在本地。
 
-7 languages: English, 简体中文, 繁體中文, Español, Русский, 日本語, 한국어. Language switcher in the sidebar footer. All user-visible strings use i18n keys.
+### 国际化
 
-### OTA Updates
+支持 7 种语言：English、简体中文、繁體中文、Español、Русский、日本語、한국어。侧边栏底部有语言切换器。所有用户可见字符串都通过 i18n key 管理。
 
-Daemon self-upgrades via npm. Trigger from the web UI for one device or all devices at once.
+### OTA 更新
 
-## What IM.codes is not
+daemon 可以通过 npm 自升级。也可以从 Web UI 为单台设备或全部设备触发升级。
 
-- Not another AI IDE
-- Not just a chat wrapper
-- Not just a remote terminal client
-- Not a replacement for Claude Code, Codex, Gemini CLI, OpenClaw, or Qwen
-- It is the messaging/control layer around them
+## IM.codes 不是什么
 
-## Architecture
+- 不是另一个 AI IDE
+- 不是聊天壳子
+- 不只是远程终端客户端
+- 不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品
+- 它是围绕这些工具的消息与控制层
+
+## 架构
 
 ```
 You (browser / mobile)
@@ -228,43 +218,43 @@ AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
-The daemon runs on your dev machine and manages process-backed agent sessions through tmux or transport-backed sessions through network protocols / local SDKs (for example Claude Code SDK, Codex SDK, OpenClaw gateway, and Qwen). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
+Daemon 运行在你的开发机上，通过 tmux 管理进程型 agent，会通过网络协议管理 transport 型 agent（例如 OpenClaw gateway）。Agent 之间可以用 `imcodes send` 互相通信。Server 负责在你的设备与 daemon 之间中转连接。所有数据都留在你自己的基础设施里。
 
-## Install
+## 安装
 
 ```bash
 npm install -g imcodes
 ```
 
-## Quick Start
+## 快速开始
 
-> **Self-hosting is strongly recommended.** The shared instance at `app.im.codes` is for testing only — it comes with no uptime guarantees, may be rate-limited, and could be targeted. This is a personal project with no commercial support. For anything beyond evaluation, deploy the server on your own infrastructure.
+> **强烈建议自托管。** 共享实例 `app.im.codes` 只用于测试，没有可用性保证，可能会被限流，也可能成为攻击目标。这是个人项目，没有商业支持。除了评估之外，建议部署到你自己的基础设施。
 
-Use [app.im.codes](https://app.im.codes) for evaluation, or self-host for anything real.
+你可以用 [app.im.codes](https://app.im.codes) 做体验，或者在正式使用时自行部署。
 
 ```bash
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
-This binds your machine, starts the daemon, registers it as a system service, and brings the machine into the web/mobile dashboard.
+这条命令会把你的机器绑定到 IM.codes，启动 daemon，把它注册成系统服务，并让这台机器出现在网页和移动端面板里。
 
-### OpenClaw Connect
+### OpenClaw 连接
 
-If OpenClaw is running locally, connect IM.codes to the OpenClaw gateway on the daemon machine:
+如果本机正在运行 OpenClaw，可以在 daemon 所在机器上把 IM.codes 连接到 OpenClaw gateway：
 
 ```bash
 imcodes connect openclaw
 ```
 
-What this does:
+这条命令会做以下事情：
 
-- connects to `ws://127.0.0.1:18789` by default
-- reuses the OpenClaw gateway token automatically from `~/.openclaw/openclaw.json`
-- syncs OpenClaw sessions and child sessions into IM.codes so they appear as transport-backed sessions/sub-sessions
-- saves the IM.codes-side connection config to `~/.imcodes/openclaw.json`
-- restarts the daemon so OpenClaw transport sessions can reconnect automatically
+- 默认连接到 `ws://127.0.0.1:18789`
+- 自动复用 `~/.openclaw/openclaw.json` 中的 OpenClaw gateway token
+- 把 OpenClaw 的主会话和子会话同步到 IM.codes，显示为 transport-backed session / sub-session
+- 把 IM.codes 侧的连接配置保存到 `~/.imcodes/openclaw.json`
+- 重启 daemon，使 OpenClaw transport 会话能自动重连
 
-Common variants:
+常见变体：
 
 ```bash
 imcodes connect openclaw --url ws://127.0.0.1:18789
@@ -272,17 +262,17 @@ OPENCLAW_GATEWAY_TOKEN=... imcodes connect openclaw
 imcodes connect openclaw --url wss://gateway.example.com
 ```
 
-Notes:
+注意：
 
-- remote non-TLS `ws://` URLs require `--insecure`
-- use `imcodes disconnect openclaw` to remove the saved config and drop the connection
-- this flow has only been tested on macOS
+- 远程的非 TLS `ws://` 地址需要加 `--insecure`
+- 可以通过 `imcodes disconnect openclaw` 删除保存的配置并断开连接
+- 这条流程目前只在 macOS 上测试过
 
-## Self-Host
+## 自托管
 
-### One-Command Setup
+### 一键部署
 
-Deploy server + daemon on a single machine. Requires Docker and a domain with DNS pointing to the server.
+在同一台机器上部署 server + daemon。需要 Docker，以及一个 DNS 已指向服务器的域名。
 
 ```bash
 npm install -g imcodes
@@ -290,18 +280,18 @@ mkdir imcodes && cd imcodes
 imcodes setup --domain imc.example.com
 ```
 
-This generates all config, starts PostgreSQL + server + Caddy with automatic HTTPS, creates the admin account, and binds the local daemon — all in one step. Credentials are printed at the end.
+这条命令会自动生成全部配置，启动 PostgreSQL + server + Caddy（自动 HTTPS），创建管理员账户，并绑定本机 daemon。最后会打印出凭据。
 
-To connect additional machines:
+如果要连接更多机器：
 
 ```bash
 npm install -g imcodes
 imcodes bind https://imc.example.com/bind/<api-key>
 ```
 
-### Manual Setup
+### 手动部署
 
-If you prefer to configure manually:
+如果你希望手动配置：
 
 ```bash
 git clone https://github.com/im4codes/imcodes.git && cd imcodes
@@ -309,73 +299,73 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 docker compose up -d
 ```
 
-The generated `docker-compose.yml` already uses `pgvector/pgvector:pg18` for PostgreSQL.
+生成的 `docker-compose.yml` 已经默认使用 `pgvector/pgvector:pg18` 作为 PostgreSQL 镜像。
 
-Login at `https://your-domain` with `admin` and the printed password. Bind your dev machine with `imcodes bind`.
+然后访问 `https://your-domain`，使用 `admin` 和打印出来的密码登录。之后使用 `imcodes bind` 绑定你的开发机。
 
-## Windows (experimental)
+## Windows（实验性）
 
-Windows is natively supported via [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) (built-in on Windows 10+). No WSL required.
+Windows 通过 [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) 原生支持（Windows 10+ 内置），不需要 WSL。
 
-### Install & Bind (Windows)
+### 安装与绑定（Windows）
 
 ```cmd
 npm install -g imcodes
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
-### Upgrade (Windows)
+### 升级（Windows）
 
 ```cmd
 imcodes upgrade
 ```
 
-Or upgrade remotely from the web dashboard (sends upgrade command to the daemon).
+你也可以从网页面板远程触发升级（会向 daemon 发送 upgrade 命令）。
 
-### Troubleshooting (Windows)
+### 故障排查（Windows）
 
-If the daemon stops after an auto-upgrade, regenerate the launch chain:
+如果 daemon 在自动升级后停止运行，可以重建启动链：
 
 ```cmd
 imcodes repair-watchdog
 ```
 
-This rewrites the watchdog script and scheduled task with the current Node.js and imcodes paths. Needed after Node.js version switches (nvm, fnm) or if the daemon won't restart after upgrade.
+这条命令会使用当前的 Node.js 和 imcodes 路径重写 watchdog 脚本和计划任务。适用于 Node.js 版本切换（nvm、fnm）之后，或者 daemon 升级后无法重启的情况。
 
-If `imcodes` is "not recognized as internal or external command" after upgrade, the npm global directory may not be on your PATH. Fix it:
+如果升级后 `imcodes` 提示 “not recognized as internal or external command”，通常是 npm 全局目录没有加入 PATH。可以这样修复：
 
 ```cmd
 npm prefix -g
 ```
 
-Copy the output path and add it to your PATH:
+复制输出路径并把它加入 PATH：
 
 ```cmd
 setx PATH "<npm-prefix-path>;%PATH%"
 ```
 
-Then open a **new** terminal window.
+然后打开一个**新的**终端窗口。
 
-Check the daemon watchdog log for errors:
+检查 daemon watchdog 日志：
 
 ```
 %USERPROFILE%\.imcodes\watchdog.log
 ```
 
-## Requirements
+## 运行要求
 
-- macOS or Linux (tested on both)
-- **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
+- macOS 或 Linux（都已验证）
+- **Windows（实验性）**：通过 ConPTY 原生支持（Windows 10+ 内置）。直接 `npm install -g imcodes` 即可，不需要额外软件。WSL 也可用。
 - Node.js >= 22
-- Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
+- 终端复用器：[tmux](https://github.com/tmux/tmux)（Linux/macOS）。Windows 使用 ConPTY（自动检测，系统内置）。
+- 至少安装一个 AI coding agent：[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[OpenClaw](https://openclaw.com) 或 [Qwen](https://github.com/QwenLM/qwen-agent)
 
-## Disclaimer
+## 免责声明
 
-IM.codes is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
+IM.codes 是一个独立开源项目，与 Anthropic、OpenAI、Google、Alibaba、OpenClaw 以及本文提到的其他公司不存在附属、背书或赞助关系。所有产品名、商标和注册商标均归其各自所有者所有。
 
-## License
+## 许可证
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 © 2026 [IM.codes](https://im.codes)
