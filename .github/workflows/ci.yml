@@ -349,7 +349,7 @@ jobs:
       - name: Publish (skip if version already on npm)
         run: |
           VERSION=${{ needs.docker.outputs.npm_version }}
-          if npm view "imcodes@${VERSION}" version >/dev/null 2>&1; then
+          if npm view "imcodes-cn@${VERSION}" version >/dev/null 2>&1; then
             echo "::warning::Version ${VERSION} already published — skipping"
           elif [ "${{ github.ref }}" = "refs/heads/dev" ]; then
             npm publish --tag dev --provenance --access public

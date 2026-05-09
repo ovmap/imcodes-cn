@@ -1,11 +1,11 @@
 {
-  "name": "imcodes",
+  "name": "imcodes-cn",
   "version": "0.1.2",
   "description": "A chat interface for AI coding agents \u2014 control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/im4codes/imcodes"
+    "url": "https://github.com/ovmap/imcodes-cn.git"
   },
   "bin": {
     "imcodes": "./dist/src/index.js"
