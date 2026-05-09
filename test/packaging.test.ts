@@ -21,7 +21,7 @@ describe('npm package integrity', () => {
     const entryDir = dirname(join(ROOT, pkg.bin.imcodes));
     const pkgFromEntry = join(entryDir, '../../package.json');
     expect(existsSync(pkgFromEntry), `package.json not reachable from ${pkg.bin.imcodes} via ../../package.json`).toBe(true);
-    expect(JSON.parse(readFileSync(pkgFromEntry, 'utf8')).name).toBe('imcodes');
+    expect(JSON.parse(readFileSync(pkgFromEntry, 'utf8')).name).toBe('imcodes-cn');
   });
 
   it('version.ts can resolve package.json', () => {
@@ -30,7 +30,7 @@ describe('npm package integrity', () => {
     const versionDir = dirname(versionJs);
     const pkgFromVersion = join(versionDir, '../../../package.json');
     expect(existsSync(pkgFromVersion), `package.json not reachable from version.js via ../../../package.json`).toBe(true);
-    expect(JSON.parse(readFileSync(pkgFromVersion, 'utf8')).name).toBe('imcodes');
+    expect(JSON.parse(readFileSync(pkgFromVersion, 'utf8')).name).toBe('imcodes-cn');
   });
 
   it('config.ts can resolve default.yaml', () => {
