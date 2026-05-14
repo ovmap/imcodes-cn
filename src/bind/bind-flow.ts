@@ -287,6 +287,10 @@ ${renderPlistProgramArguments(target)}
     <string>${process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}</string>
     <key>HOME</key>
     <string>${homedir()}</string>
+    <!-- See bind-flow.ts.installSystemdService for rationale on these flags
+         (V8 lazy-GC + heap-limit OOM cascade observed on production daemons). -->
+    <key>NODE_OPTIONS</key>
+    <string>--expose-gc --max-old-space-size=8192</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -336,6 +340,17 @@ RestartSec=5
 KillMode=process
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
+# --expose-gc lets the daemon's startGcPoller proactively trigger major
+# GC, keeping RSS bounded near the live working set. Without this flag,
+# V8 lazy major GC lets old-gen garbage accumulate to many GB before
+# collection. Observed 779 MB of unreachable garbage freed in a single
+# GC cycle on a self-hosted production daemon (211, 2026-05-10),
+# correlating with the OOM cascade behind the always-offline symptom.
+# --max-old-space-size=8192 raises the V8 heap ceiling from the 4 GB
+# default so transient working-set spikes (transformers tokenizer,
+# large timeline batches) cannot OOM during the GC poll interval.
+# Both can be overridden via a drop-in.
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 
@@ -348,6 +363,27 @@ WantedBy=default.target
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' });
   execSync('systemctl --user enable --now imcodes', { stdio: 'inherit' });
+
+  // Enable lingering so the service keeps running when the user logs out
+  // / SSH disconnects. Without this, systemd-logind tears down the
+  // per-user `systemd --user` instance after the last session ends, and
+  // imcodes goes down with it. Symptom in the wild: daemon "mysteriously
+  // disappears" overnight on every server bound via `imcodes bind` —
+  // exactly the 212/213/215 family of incidents on 2026-05-09.
+  //
+  // Best-effort: lingering requires polkit auth on some distros and may
+  // legitimately fail in rootless containers. Don't gate the rest of the
+  // bind flow on it — log a hint so the operator can run it themselves.
+  // `setup-flow.ts.installSystemdService` does the equivalent (line 415).
+  try {
+    execSync('loginctl enable-linger', { stdio: 'ignore' });
+    console.log('Systemd user-linger enabled (daemon survives logout).');
+  } catch {
+    console.log(
+      'Note: could not enable systemd user-linger automatically. The daemon '
+      + 'will stop when you log out unless you run: `loginctl enable-linger`',
+    );
+  }
   console.log(`Systemd user service installed: ${servicePath}`);
 }
 

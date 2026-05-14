@@ -40,6 +40,32 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('sub-session accents stay on card/button top borders and window full borders', () => {
+    const cardRule = css.match(/\.subcard\s*\{[^}]*\}/);
+    expect(cardRule).not.toBeNull();
+    expect(cardRule![0]).toMatch(/border-top:\s*3px solid var\(--subsession-accent-color/);
+
+    const collapsedButtonRule = css.match(/\.subsession-card\s*\{[^}]*\}/);
+    expect(collapsedButtonRule).not.toBeNull();
+    expect(collapsedButtonRule![0]).toMatch(/border-top:\s*3px solid var\(--subsession-accent-color/);
+
+    const windowRule = css.match(/\.subsession-window\s*\{[^}]*\}/);
+    expect(windowRule).not.toBeNull();
+    expect(windowRule![0]).toMatch(/border:\s*1px solid var\(--subsession-accent-color/);
+
+    const maximizedWindowRule = css.match(/\.subsession-window-maximized\s*\{[^}]*\}/);
+    expect(maximizedWindowRule).not.toBeNull();
+    expect(maximizedWindowRule![0]).toMatch(/border:\s*2px solid var\(--subsession-accent-color/);
+  });
+
+  it('active brain session tab keeps a thicker purple bottom border', () => {
+    const activeBrainRule = css.match(/\.tab\.brain\.active\s*\{[^}]*\}/);
+    expect(activeBrainRule).not.toBeNull();
+    expect(activeBrainRule![0]).toMatch(/border-top-color:\s*transparent/);
+    expect(activeBrainRule![0]).toMatch(/border-bottom-color:\s*#8b5cf6/);
+    expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*4px/);
+  });
+
   it('.fb-changes-section must NOT cap height — list must scroll past 10 items', () => {
     // User reported: file browser changes list silently hides items
     // beyond ~10 even though the DOM has them. Root cause:

@@ -309,10 +309,17 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - name: Install tmux
-        run: sudo apt-get install -y tmux
-      - name: Prime tmux server
-        run: tmux new-session -d -s init && tmux kill-session -t init
+      # tmux is no longer needed here: `test:coverage` skips the e2e project
+      # (which spawns real tmux + agent processes), saving ~1 min per run.
+      #
+      # `npm run build` IS still needed: although most tests resolve from
+      # `src/` via vitest's tsx transform, two suites assert against the
+      # built output and FAIL without `dist/`:
+      #   - test/packaging.test.ts             (verifies bin/main/files paths)
+      #   - test/util/postinstall-sharp-repair.test.ts (executes dist/.../postinstall-sharp-repair.js)
+      # Both run in the `daemon` project, which is included in coverage. They
+      # pass in the regular Unit Tests jobs because those run `npm run build`
+      # first; coverage must do the same.
       - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (needed for tsx component tests)
         run: ./scripts/ci-npm-ci.sh web
@@ -320,6 +327,15 @@ jobs:
         run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - run: npm run test:coverage
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            !coverage/tmp/
+          if-no-files-found: error
       - name: Upload to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4

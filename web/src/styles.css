@@ -51,7 +51,7 @@ body {
 .tab:hover { color: #c9d1d9; background: #161b22; }
 .tab.active { color: #e6edf3; background: #161b22; border-top-color: #3b82f6; border-bottom-color: transparent; }
 .tab.brain { color: #9e7ff0; }
-.tab.brain.active { color: #c4b5fd; border-top-color: #8b5cf6; }
+.tab.brain.active { color: #c4b5fd; border-top-color: transparent; border-top-width: 2px; border-bottom-color: #8b5cf6; border-bottom-width: 4px; }
 .tab.idle::after { content: '●'; margin-left: 5px; color: #3fb950; font-size: 7px; vertical-align: middle; }
 .tab.busy::after { content: '◌'; margin-left: 5px; color: #e3b341; font-size: 7px; vertical-align: middle; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -1002,6 +1002,7 @@ body {
 .view-toggle:hover { background: #334155; }
 .desktop-view-toggle { display: flex; justify-content: flex-end; padding: 2px 8px; background: #0f172a; gap: 4px; }
 .desktop-view-toggle .view-toggle { font-size: 12px; padding: 2px 8px; }
+.desktop-view-toggle .desktop-main-maximize-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; }
 .desktop-fb-float { position: fixed; z-index: 1500; display: flex; flex-direction: column; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; }
 .desktop-fb-titlebar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #334155; cursor: grab; flex-shrink: 0; user-select: none; }
 .desktop-fb-titlebar:active { cursor: grabbing; }
@@ -1021,6 +1022,7 @@ body {
 .subcard-size-input:focus { border-color: #3b82f6; }
 .subcard-toolbar-label { font-size: 11px; color: #475569; }
 .daemon-stats-inline { font-size: 11px; margin-left: 8px; white-space: nowrap; }
+.daemon-local-clock { color: #94a3b8; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .subcard-toolbar-add { background: none; border: 1px dashed #475569; border-radius: 4px; color: #64748b; cursor: pointer; font-size: 16px; padding: 0 8px; margin-left: auto; transition: all 0.12s; }
 .subcard-toolbar-add:hover { border-color: #3b82f6; color: #93c5fd; }
 .subcard-empty-state { padding: 8px 12px; font-size: 12px; color: #475569; }
@@ -1036,7 +1038,7 @@ body {
 .subcard-drag-wrap:active { cursor: grabbing; }
 
 /* Individual card */
-.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; isolation: isolate; }
+.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; isolation: isolate; }
 .subcard-header { border-radius: 8px 8px 0 0; overflow: hidden; }
 .subcard:hover { border-color: #475569; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
 .subcard-open { border-color: #334d6b; }
@@ -1047,6 +1049,11 @@ body {
 @keyframes subcard-focus-glow { 0%, 100% { box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; } 50% { box-shadow: 0 0 16px #60a5facc, 0 0 32px #3b82f666; } }
 .subcard-focused:not(.subcard-running-pulse) { border-color: #60a5fa; border-width: 2px; box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; }
 .subcard-focused.subcard-running-pulse { border-width: 2px; box-shadow: 0 0 12px #60a5faaa, 0 0 24px #3b82f644; }
+.subcard,
+.subcard:hover,
+.subcard-open,
+.subcard-focused,
+.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subcard:not(.subcard-running-pulse):not(.subcard-focused) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 @keyframes idle-flash-opacity { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
@@ -1118,9 +1125,13 @@ body {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; }
+.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; }
 .subsession-card:hover, .subsession-card.open { border-color: #3b82f6; background: #1e3a5f; color: #93c5fd; }
 .subsession-card.open { transform: scale(1.12); z-index: 1; box-shadow: 0 0 8px rgba(59,130,246,0.4); }
+.subsession-card,
+.subsession-card:hover,
+.subsession-card.open,
+.subsession-card.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subsession-card-icon { font-size: 13px; font-weight: 700; letter-spacing: -0.5px; line-height: 1; }
 .subsession-card-label { font-size: 10px; color: #64748b; }
 .subsession-card.open .subsession-card-label { color: #93c5fd; }
@@ -1131,7 +1142,8 @@ body {
 .subsession-card-ctx-fill { display: block; height: 100%; background: #3b82f6; border-radius: 1px; transition: width 0.3s; }
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
-.subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
 .subsession-drag-icon { color: #475569; font-size: 16px; cursor: grab; }
 .subsession-title { font-size: 12px; color: #94a3b8; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1148,12 +1160,13 @@ body {
 /* Usage footer — between chat/terminal and input controls */
 .session-usage-footer { flex-shrink: 0; padding: 4px 10px 3px; background: #0f1117; border-top: 1px solid #1e293b; }
 .session-ctx-bar { position: relative; width: 100%; height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
+.session-repo-branch-summary-chat-titlebar { min-width: 0; max-width: 180px; flex-shrink: 1; }
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: #34d399; border-radius: 3px; }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 3px; }
-.session-usage-stats { display: flex; justify-content: space-between; font-size: 10px; color: #475569; }
+.session-usage-stats { display: flex; align-items: center; gap: 6px; justify-content: space-between; min-width: 0; font-size: 10px; color: #475569; }
 .session-live-status-inline { display: inline-flex; align-items: center; justify-content: center; gap: 1px; min-width: 20px; color: #818cf8; min-width: 0; max-width: min(42vw, 240px); }
 .session-live-status-emoji { display: inline-block; font-size: 12px; line-height: 1; filter: saturate(1.1); }
 .session-live-status-emoji.robot { transform: translateY(0.2px); }

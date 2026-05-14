@@ -11,9 +11,10 @@ import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryConte
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
-import { FileBrowser } from './file-browser-lazy.js';
-import { FloatingPanel } from './FloatingPanel.js';
+import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
+import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
@@ -39,12 +40,16 @@ interface Props {
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
   preview?: boolean;
-  /** When provided, clicking file paths in chat messages opens FileBrowser */
+  /** When provided, clicking file paths opens the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** When provided, the right-side file panel is available. */
   ws?: WsClient | null;
   /** Called when user inserts a path via the FileBrowser opened from a chat message */
   onInsertPath?: (path: string) => void;
   /** Session working directory — used to resolve relative paths clicked in chat */
   workdir?: string | null;
+  /** Opens the repository view for this session/project. */
+  onViewRepo?: () => void;
   /** Called when user quotes selected text. */
   onQuote?: (text: string) => void;
   agentType?: string | null;
@@ -88,6 +93,17 @@ function extractChatEventText(target: HTMLElement): string {
 function hasFileExtension(path: string): boolean {
   const basename = path.split(/[/\\]/).pop() ?? '';
   return /\.\w{1,10}$/.test(basename);
+}
+
+function isAbsolutePreviewPath(path: string): boolean {
+  return path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
+}
+
+function resolvePreviewPath(path: string, workdir: string | null | undefined): string {
+  const cleaned = path.replace(/^`+|`+$/g, '');
+  if (isAbsolutePreviewPath(cleaned)) return cleaned;
+  const root = (workdir && workdir.trim()) || '~';
+  return `${root.replace(/[/\\]+$/, '')}/${cleaned.replace(/^[/\\]+/, '')}`;
 }
 
 function isLikelyDomainPath(value: string): boolean {
@@ -165,11 +181,6 @@ const TOOL_INPUT_SUMMARY_KEYS = [
   'description',
   'name',
 ] as const;
-
-type FileBrowserTarget = {
-  path: string;
-  preferDiff: boolean;
-};
 
 type GroupedFileChange = {
   filePath: string;
@@ -602,11 +613,10 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const [fileBrowserTarget, setFileBrowserTarget] = useState<FileBrowserTarget | null>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
@@ -732,17 +742,25 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     document.addEventListener('mouseup', onUp);
   }, [sessionId]);
 
-  const openFileBrowserTarget = useCallback((path: string, preferDiff = false) => {
-    setFileBrowserTarget({ path: path.replace(/^`+|`+$/g, ''), preferDiff });
-  }, []);
+  const openFilePreview = useCallback((path: string, preferDiff = false) => {
+    if (!onPreviewFile) return;
+    const resolvedPath = resolvePreviewPath(path, workdir);
+    onPreviewFile({
+      path: resolvedPath,
+      preferDiff,
+      preview: { status: 'loading', path: resolvedPath },
+      rootPath: workdir ?? undefined,
+      sourcePreviewLive: false,
+    });
+  }, [onPreviewFile, workdir]);
 
   const handlePathClick = useCallback((path: string) => {
-    openFileBrowserTarget(path, false);
-  }, [openFileBrowserTarget]);
+    openFilePreview(path, false);
+  }, [openFilePreview]);
 
   const handleFileChangeOpen = useCallback((path: string, preferDiff = false) => {
-    openFileBrowserTarget(path, preferDiff);
-  }, [openFileBrowserTarget]);
+    openFilePreview(path, preferDiff);
+  }, [openFilePreview]);
 
   const handleUrlClick = useCallback((url: string) => {
     setPendingUrl(url);
@@ -764,6 +782,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [serverId, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
+  const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
@@ -1294,6 +1313,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  // Per-machine chat-window font preference (family + size). Stored in
+  // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
+  // because each machine's display, OS font availability, and viewing
+  // distance differ. Surfaced via the title-bar dropdown on every platform
+  // — phones included — so users can pick the font that reads best for them.
+  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  const chatFontStyle = !preview
+    ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
+    : undefined;
   const historySteps = useMemo(() => {
     if (!historyStatus || historyStatus.phase === 'idle') return [];
     const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
@@ -1328,6 +1356,37 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         </button>
       )}
       <div class="chat-main">
+        {!preview && (
+          <div
+            class="chat-titlebar"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              // Left-align the font dropdown so it doesn't collide with the
+              // absolutely-positioned `chat-panel-toggle` (⊞) at top:6/right:8.
+              // The two controls now sit at opposite ends and never overlap.
+              justifyContent: 'flex-start',
+              gap: 6,
+              padding: '4px 8px',
+              minHeight: 30,
+              flexShrink: 0,
+              borderBottom: '1px solid rgba(51,65,85,0.5)',
+              background: 'rgba(15,23,42,0.35)',
+            }}
+          >
+            <FontPrefsDropdown
+              prefs={chatFontPrefs}
+              onChange={setChatFontPrefs}
+              variant="compact"
+            />
+            <SessionRepoBranchSummary
+              sessionId={sessionId}
+              projectDir={workdir}
+              onOpenRepo={onViewRepo}
+              className="session-repo-branch-summary-chat-titlebar"
+            />
+          </div>
+        )}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -1383,7 +1442,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
         )}
-        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
@@ -1480,18 +1539,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
                     onPathClick={pathClickHandler}
                     onUrlClick={urlClickHandler}
-                    onFileChangeOpen={handleFileChangeOpen}
+                    onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
                     serverId={serverId}
                     onResendFailed={onResendFailed}
@@ -1621,6 +1680,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 if (paths[0]) onInsertPath?.(paths[0]);
               }}
               onInsertPath={onInsertPath}
+              onPreviewFile={onPreviewFile ? (request) => onPreviewFile({
+                ...request,
+                rootPath: request.rootPath ?? workdir ?? undefined,
+                sourcePreviewLive: false,
+              }) : undefined}
             />
           </div>
         </>
@@ -1650,46 +1714,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             </div>
           </div>
         </div>
-      )}
-      {fileBrowserTarget && ws && (
-        <FloatingPanel
-          id="chat-file-preview"
-          title={`📄 ${fileBrowserTarget.path.split(/[/\\]/).pop() ?? fileBrowserTarget.path}`}
-          onClose={() => setFileBrowserTarget(null)}
-          defaultW={600}
-          defaultH={500}
-        >
-          <FileBrowser
-            ws={ws}
-            serverId={serverId}
-            mode="file-single"
-            layout="panel"
-            initialPath={(() => {
-              const path = fileBrowserTarget.path;
-              const isAbsolute = path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
-              const resolved = isAbsolute ? path : `${workdir ?? '~'}/${path}`;
-              return resolved.includes('.') && !resolved.endsWith('/')
-                ? resolved.split(/[/\\]/).slice(0, -1).join('/') || '~'
-                : resolved;
-            })()}
-            highlightPath={fileBrowserTarget.path.startsWith('/') || fileBrowserTarget.path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserTarget.path)
-              ? fileBrowserTarget.path
-              : `${workdir ?? '~'}/${fileBrowserTarget.path}`}
-            autoPreviewPath={fileBrowserTarget.path.startsWith('/') || fileBrowserTarget.path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserTarget.path)
-              ? fileBrowserTarget.path
-              : `${workdir ?? '~'}/${fileBrowserTarget.path}`}
-            autoPreviewPreferDiff={fileBrowserTarget.preferDiff}
-            onConfirm={(paths) => {
-              if (paths[0]) onInsertPath?.(paths[0]);
-              setFileBrowserTarget(null);
-            }}
-            onInsertPath={onInsertPath ? (path) => {
-              onInsertPath(path);
-              setFileBrowserTarget(null);
-            } : undefined}
-            onClose={() => setFileBrowserTarget(null)}
-          />
-        </FloatingPanel>
       )}
     </div>
   );

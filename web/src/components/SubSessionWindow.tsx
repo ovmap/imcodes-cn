@@ -9,10 +9,11 @@ import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
+import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
@@ -26,10 +27,21 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
+import {
+  clampGeometryToWorkspace,
+  geometryFromWorkspace,
+  normalizeWindowGeometry,
+  reserveWorkspaceBottom,
+  shouldPersistGeometry,
+  viewportWorkspaceBelowSessionTabs,
+  type WindowGeometry,
+  type WorkspaceBounds,
+} from '../desktop-window-maximize.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 
-interface WindowGeometry { x: number; y: number; w: number; h: number }
+type GetMaximizeBounds = () => WorkspaceBounds | null;
 
 interface Props {
   sub: SubSession;
@@ -42,10 +54,18 @@ interface Props {
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
   onClose: () => void;
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
+  onRestoreBeforeClose?: () => void;
+  getMaximizeBounds?: GetMaximizeBounds;
+  desktopLayoutCapable?: boolean;
   onRestart: () => void;
   onRename: () => void;
   onSettings?: () => void;
+  onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Open a file preview in the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -72,6 +92,7 @@ interface Props {
   detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  accentColor?: string;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -94,27 +115,46 @@ const MIN_W = 300;
 const MIN_H = 200;
 const DESKTOP_VISIBLE_MARGIN = 32;
 
+function currentDesktopBounds(): WorkspaceBounds {
+  return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    minW: MIN_W,
+    minH: MIN_H,
+  }));
+}
+
 function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
-  const maxW = Math.max(MIN_W, window.innerWidth);
-  const maxH = Math.max(MIN_H, window.innerHeight);
-  const w = Math.min(Math.max(geom.w, MIN_W), maxW);
-  const h = Math.min(Math.max(geom.h, MIN_H), maxH);
-  const x = Math.min(Math.max(geom.x, DESKTOP_VISIBLE_MARGIN - w), window.innerWidth - DESKTOP_VISIBLE_MARGIN);
-  const y = Math.min(Math.max(geom.y, 0), window.innerHeight - DESKTOP_VISIBLE_MARGIN);
-  return { x, y, w, h };
+  const bounds = currentDesktopBounds();
+  const clamped = clampGeometryToWorkspace(geom, bounds, {
+    minW: MIN_W,
+    minH: MIN_H,
+    visibleMargin: DESKTOP_VISIBLE_MARGIN,
+  });
+  return {
+    ...clamped,
+    y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
+  };
 }
 
 function loadLocal(id: string): { geom: WindowGeometry; viewMode: ViewMode } {
+  const fallback = {
+    x: Math.max(0, (window.innerWidth - DEFAULT_W) / 2),
+    y: Math.max(0, (window.innerHeight - DEFAULT_H) / 2 - 80),
+    w: DEFAULT_W,
+    h: DEFAULT_H,
+  };
   try {
     const raw = localStorage.getItem(LOCAL_KEY(id));
     if (raw) {
-      const parsed = JSON.parse(raw) as { geom: WindowGeometry; viewMode: ViewMode };
-      return { ...parsed, geom: clampDesktopGeom(parsed.geom) };
+      const parsed = JSON.parse(raw) as { geom?: unknown; viewMode?: unknown };
+      return {
+        geom: clampDesktopGeom(normalizeWindowGeometry(parsed.geom, fallback)),
+        viewMode: parsed.viewMode === 'terminal' || parsed.viewMode === 'chat' ? parsed.viewMode : 'chat',
+      };
     }
   } catch { /* ignore */ }
-  const cx = Math.max(0, (window.innerWidth - DEFAULT_W) / 2);
-  const cy = Math.max(0, (window.innerHeight - DEFAULT_H) / 2 - 80);
-  return { geom: clampDesktopGeom({ x: cx, y: cy, w: DEFAULT_W, h: DEFAULT_H }), viewMode: 'chat' };
+  return { geom: clampDesktopGeom(fallback), viewMode: 'chat' };
 }
 
 function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
@@ -124,11 +164,12 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const isDesktopMaximized = desktopLayoutCapable && maximized;
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
   // ── Shared git-changes cache for the 📁 badge ─────────────────────────────
@@ -232,6 +273,7 @@ export function SubSessionWindow({
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
+  const [maximizeBoundsVersion, setMaximizeBoundsVersion] = useState(0);
   // confirmClose removed — × now minimizes instead of terminating
 
   const inputRef = useRef<HTMLDivElement>(null);
@@ -283,16 +325,23 @@ export function SubSessionWindow({
   };
 
   useEffect(() => {
+    if (!shouldPersistGeometry(isDesktopMaximized)) return;
     saveLocal(sub.id, geom, viewMode);
-  }, [sub.id, geom, viewMode]);
+  }, [sub.id, geom, viewMode, isDesktopMaximized]);
 
   useEffect(() => {
     if (isMobile) return;
-    const onResize = () => setGeom((g) => clampDesktopGeom(g));
+    const onResize = () => {
+      if (isDesktopMaximized) {
+        setMaximizeBoundsVersion((v) => v + 1);
+      } else {
+        setGeom((g) => clampDesktopGeom(g));
+      }
+    };
     window.addEventListener('resize', onResize);
     requestAnimationFrame(onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [isMobile]);
+  }, [isMobile, isDesktopMaximized]);
 
   // Scroll to bottom whenever switching to chat view;
   // force fit + full terminal refresh when switching to terminal view.
@@ -340,6 +389,10 @@ export function SubSessionWindow({
   }, []);
 
   const startDrag = useCallback((e: MouseEvent) => {
+    if (isDesktopMaximized) {
+      onFocus();
+      return;
+    }
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable]')) return;
     dragStart.current = { mx: e.clientX, my: e.clientY, ox: geomRef.current.x, oy: geomRef.current.y };
     onFocus();
@@ -360,7 +413,7 @@ export function SubSessionWindow({
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
     e.preventDefault();
-  }, [onFocus, clampPos]);
+  }, [isDesktopMaximized, onFocus, clampPos]);
 
   const onHeaderMouseDown = startDrag;
 
@@ -370,6 +423,7 @@ export function SubSessionWindow({
   const onResizeMouseDown = useCallback((dir: ResizeDir) => (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
+    if (isDesktopMaximized) return;
     onFocus();
     const startG = { ...geomRef.current };
     const sx = e.clientX, sy = e.clientY;
@@ -381,7 +435,12 @@ export function SubSessionWindow({
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
         if (dir.includes('w')) { w = Math.max(MIN_W, startG.w - dx); x = startG.x + (startG.w - w); }
-        if (dir.includes('n')) { h = Math.max(MIN_H, startG.h - dy); y = startG.y + (startG.h - h); }
+        if (dir.includes('n')) {
+          const bounds = currentDesktopBounds();
+          const startBottom = startG.y + startG.h;
+          y = Math.max(bounds.y, Math.min(startG.y + dy, startBottom - MIN_H));
+          h = startBottom - y;
+        }
         return clampDesktopGeom({ x, y, w, h });
       });
     };
@@ -391,7 +450,7 @@ export function SubSessionWindow({
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [onFocus]);
+  }, [isDesktopMaximized, onFocus]);
 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const typeLabel = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -401,10 +460,30 @@ export function SubSessionWindow({
 
   // HTML5 drag-to-pin: set dataTransfer so sidebar can read panel type + id
   const handleDragStart = useCallback((e: DragEvent) => {
+    if (isDesktopMaximized) { e.preventDefault(); return; }
     if (!isPinnable) { e.preventDefault(); return; }
     e.dataTransfer?.setData('application/x-pinpanel', JSON.stringify({ type: 'subsession', id: sub.id }));
     e.dataTransfer?.setData('text/plain', sub.id); // fallback
-  }, [isPinnable, sub.id]);
+  }, [isPinnable, isDesktopMaximized, sub.id]);
+
+  const handleToggleMaximized = useCallback(() => {
+    onFocus();
+    onToggleMaximized?.();
+  }, [onFocus, onToggleMaximized]);
+
+  const restoreBeforeClosing = useCallback(() => {
+    if (maximized) onRestoreBeforeClose?.();
+  }, [maximized, onRestoreBeforeClose]);
+
+  const handleMinimize = useCallback(() => {
+    restoreBeforeClosing();
+    onMinimize();
+  }, [onMinimize, restoreBeforeClosing]);
+
+  const handleClose = useCallback(() => {
+    restoreBeforeClosing();
+    onClose();
+  }, [onClose, restoreBeforeClosing]);
 
   // Usage tracking
   const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
@@ -464,8 +543,15 @@ export function SubSessionWindow({
     return () => ro.disconnect();
   }, [isMobile]);
 
+  const displayGeom = useMemo(() => {
+    if (!isDesktopMaximized || isMobile) return geom;
+    const bounds = getMaximizeBounds?.();
+    return bounds ? geometryFromWorkspace(bounds) : clampDesktopGeom(geom);
+  }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
+
   const style: Record<string, string | number> = isMobile
     ? {
+        '--subsession-accent-color': accentColor,
         position: 'fixed',
         top: 'var(--sat, 0px)',
         left: 0,
@@ -474,13 +560,18 @@ export function SubSessionWindow({
         height: `calc(${vvh}px - var(--sat, 0px) - ${controlsHeight}px)`,
         zIndex,
       }
-    : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
+    : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
 
   return (
-    <div ref={swipeBackRef} class="subsession-window" style={style} onMouseDown={onFocus}>
+    <div
+      ref={swipeBackRef}
+      class={`subsession-window${isDesktopMaximized ? ' subsession-window-maximized' : ''}`}
+      style={style}
+      onMouseDown={onFocus}
+    >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
-      {!isMobile && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
+      {!isMobile && !isDesktopMaximized && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
         <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />
       ))}
 
@@ -488,7 +579,7 @@ export function SubSessionWindow({
       <div
         class="subsession-header"
         onMouseDown={onHeaderMouseDown}
-        draggable={!!isPinnable}
+        draggable={!!isPinnable && !isDesktopMaximized}
         onDragStart={handleDragStart}
       >
         <span class="subsession-drag-icon">⠿</span>
@@ -514,8 +605,14 @@ export function SubSessionWindow({
             {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
           </button>
           {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
-          <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
-          <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
+          {desktopLayoutCapable && onToggleMaximized && (
+            <DesktopWindowMaximizeButton
+              maximized={isDesktopMaximized}
+              onClick={handleToggleMaximized}
+            />
+          )}
+          <button class="subsession-minimize-btn" onClick={handleMinimize} title={t('window.minimize')} aria-label={t('window.minimize')}>▾</button>
+          <button class="subsession-close-btn" onClick={handleMinimize} title={t('window.hide')} aria-label={t('window.hide')}>×</button>
         </div>
       </div>
 
@@ -544,6 +641,8 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
+            onViewRepo={onViewRepo}
+            onPreviewFile={onPreviewFile}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
@@ -553,7 +652,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {!isShell && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
@@ -607,7 +706,7 @@ export function SubSessionWindow({
         }}
         onSubRestart={onRestart}
         onSubNew={onRestart}
-        onSubStop={onClose}
+        onSubStop={handleClose}
         onRenameSession={onRename}
         onSettings={onSettings}
         subSessionId={sub.id}
