@@ -19,6 +19,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.title') return 'OpenSpec';
       if (key === 'openspec.changes') return 'changes';
       if (key === 'openspec.empty') return 'empty';
+      if (key === 'openspec.load_timeout') return 'openspec_timeout';
+      if (key === 'openspec.load_unavailable') return 'openspec_unavailable';
+      if (key === 'openspec.load_error') return 'openspec_error';
       if (key === 'openspec.audit_action') return 'audit_action';
       if (key === 'openspec.audit_implementation_action') return 'audit_implementation_action';
       if (key === 'openspec.audit_spec_action') return 'audit_spec_action';
@@ -67,6 +70,7 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.clone.menu') return 'Copy session group';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
       if (key === 'session.approval.pending') return 'Approval required';
@@ -185,7 +189,7 @@ vi.mock('../../src/api.js', () => ({
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
-import { SessionControls } from '../../src/components/SessionControls.js';
+import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
@@ -205,20 +209,34 @@ function readBlobText(blob: Blob): Promise<string> {
 const TEST_OPENSPEC_ADVANCED_ROUNDS = [
   {
     id: 'initial_audit',
-    mode: 'audit',
-    rounds: 1,
-    summaryMode: 'append',
+    title: 'Initial audit',
+    preset: 'proposal_audit',
+    executionMode: 'multi_dispatch',
+    permissionScope: 'analysis_only',
+    timeoutMinutes: 5,
   },
   {
     id: 'implementation_plan',
-    mode: 'plan',
-    rounds: 1,
-    summaryMode: 'append',
+    title: 'Implementation plan',
+    preset: 'implementation',
+    executionMode: 'single_main',
+    permissionScope: 'implementation',
+    timeoutMinutes: 5,
   },
 ] as const;
 
-const makeWs = () => {
+const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number; observedAt: number } | null } = {}) => {
   const handlers = new Set<(msg: unknown) => void>();
+  // Default to a fresh capability snapshot so the advanced launch gate doesn't
+  // accidentally suppress envelopes in tests that don't care about it.
+  const defaultSnapshot = {
+    daemonId: 'daemon-test',
+    capabilities: ['p2p.workflow.v1'],
+    helloEpoch: 1,
+    sentAt: Date.now(),
+    observedAt: Date.now(),
+  };
+  const capabilitySnapshot = overrides.capabilitySnapshot === undefined ? defaultSnapshot : overrides.capabilitySnapshot;
   return {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
@@ -226,7 +244,12 @@ const makeWs = () => {
     // Stop must reach the server even during a brief WS probe (`_connected
     // = false` for ~50-200ms after focus/visibility ticks).
     sendSessionCommandUrgent: vi.fn(),
+    cloneSessionGroup: vi.fn(),
+    cancelSessionGroupClone: vi.fn(),
     sendInput: vi.fn(),
+    requestSessionList: vi.fn(),
+    p2pStatus: vi.fn(),
+    p2pListDiscussions: vi.fn(),
     subscribeTransportSession: vi.fn(),
     unsubscribeTransportSession: vi.fn(),
     respondTransportApproval: vi.fn(),
@@ -237,6 +260,9 @@ const makeWs = () => {
       handlers.add(handler);
       return () => handlers.delete(handler);
     }),
+    getDaemonCapabilitySnapshot: vi.fn(() => capabilitySnapshot),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => {}),
+    isDaemonCapabilityStale: vi.fn(() => false),
     emit: (msg: unknown) => {
       handlers.forEach((handler) => handler(msg));
     },
@@ -257,8 +283,24 @@ function gatherSendCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, un
     .map(([, p]) => p as Record<string, unknown>);
 }
 
+function gatherCancelCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, unknown>> {
+  return [
+    ...ws.sendSessionCommand.mock.calls,
+    ...ws.sendSessionCommandUrgent.mock.calls,
+  ]
+    .filter(([cmd]) => cmd === 'cancel')
+    .map(([, p]) => p as Record<string, unknown>);
+}
+
 function expectSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
   expect(gatherSendCalls(ws)).toContainEqual(expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+}
+
+function expectCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(gatherCancelCalls(ws)).toContainEqual(expect.objectContaining({
     ...payload,
     commandId: expect.any(String),
   }));
@@ -344,7 +386,7 @@ afterEach(() => {
     patchSubSessionMock.mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.slice('p2p_session_config:'.length);
+        const sessionKey = key.split(':').pop() ?? key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
             [sessionKey]: { enabled: true, mode: 'audit' },
@@ -361,6 +403,64 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('shows copy group action only for main-session controls and hides it from sub/compact surfaces', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        serverId="server-1"
+        sessions={[mainSession]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.getByText('Copy session group')).toBeDefined();
+    fireEvent.click(screen.getByText('Copy session group'));
+    expect(screen.getByRole('dialog')).toBeDefined();
+    expect(screen.getByDisplayValue('deck_my-project_brain')).toBeDefined();
+    expect(screen.getByText('deck_my_project_1_brain')).toBeDefined();
+    expect(screen.queryByText('brain copy')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        subSessionId="abc"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.queryByText('Copy session group')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={subSession('deck_sub_worker', 'Worker')}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.queryByText('Copy session group')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+
+    expect(screen.queryByTitle('actions')).toBeNull();
+    expect(screen.queryByText('Copy session group')).toBeNull();
   });
 
   it('keeps openspec through p2p settings controls visible in compact card mode', () => {
@@ -553,7 +653,7 @@ afterEach(() => {
     expect(firstPayload.commandId).not.toBe(secondPayload.commandId);
   });
 
-  it('sends advanced p2p config fields when config mode is used', async () => {
+  it('sends an advanced p2p workflow envelope when config mode is used', async () => {
     const ws = makeWs();
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
@@ -605,15 +705,23 @@ afterEach(() => {
         'deck_sub_abc': { enabled: true, mode: 'review' },
       },
       p2pRounds: 3,
-      p2pAdvancedPresetKey: 'openspec',
-      p2pAdvancedRounds: TEST_OPENSPEC_ADVANCED_ROUNDS,
-      p2pAdvancedRunTimeoutMinutes: 45,
-      p2pContextReducer: {
-        mode: 'clone_sdk_session',
-        templateSession: 'my-session',
-      },
       p2pLocale: 'en',
     });
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.p2pWorkflowLaunchEnvelope).toEqual(expect.objectContaining({
+      workflowSchemaVersion: 1,
+      workflowKind: 'advanced',
+      launchContext: expect.objectContaining({
+        sessionName: 'my-session',
+        userText: 'ship it',
+        locale: 'en',
+      }),
+    }));
+    expect(JSON.stringify(sent.p2pWorkflowLaunchEnvelope)).not.toMatch(/compiledWorkflow|privateRuntimeState|rawPrompt|rawScriptOutput|artifactBaselines|token|env/i);
+    expect(sent).not.toHaveProperty('p2pAdvancedPresetKey');
+    expect(sent).not.toHaveProperty('p2pAdvancedRounds');
+    expect(sent).not.toHaveProperty('p2pAdvancedRunTimeoutMinutes');
+    expect(sent).not.toHaveProperty('p2pContextReducer');
   });
 
   it('keeps the p2p button in solo mode after triggering a combo from the dropdown', async () => {
@@ -722,6 +830,22 @@ afterEach(() => {
     expect(currentFetches).toBe(initialFetches);
   });
 
+  it('loads P2P config from a server-scoped preference key when a server is selected', async () => {
+    getUserPrefMock.mockResolvedValue(null);
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        serverId="srv-one"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await flushAsync();
+
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-one:my-session');
+  });
+
   it('syncs loaded P2P config into daemon authority on mount', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
@@ -782,6 +906,26 @@ afterEach(() => {
     expect(screen.getByText(/mode_audit→mode_plan/i)).toBeDefined();
   });
 
+  it('puts the global rounds selector at the top of the P2P dropdown and saves changes', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+
+    const menu = screen.getByTestId('p2p-dropdown');
+    const rounds = within(menu).getByTestId('p2p-dropdown-rounds');
+    const solo = within(menu).getByRole('button', { name: /P2P$/i });
+    expect(rounds.compareDocumentPosition(solo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(within(rounds).getByTestId('p2p-dropdown-round-2'));
+    await flushAsync();
+
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      'p2p_session_config:my-session',
+      expect.stringContaining('"rounds":2'),
+    );
+  });
+
   it('updates the p2p dropdown when custom combos are created without a page refresh', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
@@ -834,7 +978,7 @@ afterEach(() => {
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
-      p2pRounds: 2,
+      p2pRounds: 3,
       p2pLocale: 'en',
     });
     expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_combo_direct_send_skip_confirm', true);
@@ -855,7 +999,7 @@ afterEach(() => {
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
-      p2pRounds: 2,
+      p2pRounds: 3,
       p2pLocale: 'en',
     });
   });
@@ -885,7 +1029,7 @@ afterEach(() => {
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
-      p2pRounds: 2,
+      p2pRounds: 3,
       p2pLocale: 'en',
     });
   });
@@ -933,6 +1077,53 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'change-a' }));
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('does not leave openspec changes loading when the list request cannot be sent', async () => {
+    const ws = makeWs();
+    ws.fsListDir.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+    expect(screen.queryByText('loading')).toBeNull();
+    expect(screen.getByText('openspec_unavailable')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
+  });
+
+  it('times out openspec changes loading if the daemon never responds', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      expect(screen.getByText('loading')).toBeDefined();
+
+      await act(async () => {
+        vi.advanceTimersByTime(OPENSPEC_LIST_REQUEST_TIMEOUT_MS);
+      });
+
+      expect(screen.queryByText('loading')).toBeNull();
+      expect(screen.getByText('openspec_timeout')).toBeDefined();
+      expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('inserts an openspec implementation-audit prompt without sending immediately', async () => {
@@ -1671,6 +1862,27 @@ afterEach(() => {
     });
   });
 
+  it('typing /stop in a transport input sends direct cancel instead of chat text', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({ name: 'qwen-session', agentType: 'qwen', state: 'running' })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/stop';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({ text: '/stop' }));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('shows a running transport send in the queue instead of injecting a timeline bubble', () => {
     const ws = makeWs();
     const onSend = vi.fn();
@@ -2126,6 +2338,34 @@ afterEach(() => {
     expect(screen.queryByRole('button', { name: '1 queued' })).toBeNull();
   });
 
+  it('sends /compact without creating an optimistic user bubble', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/compact';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: '/compact',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('qwen oauth model dropdown only shows coder-model even if stale model list exists', () => {
     render(<SessionControls
       ws={makeWs() as any}
@@ -2333,7 +2573,7 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
-  it('pressing Escape in a running transport input sends /stop command', () => {
+  it('pressing Escape in a running transport input sends direct cancel', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2351,8 +2591,13 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     fireEvent.keyDown(input, { key: 'Escape' });
 
-    // Transport sessions send /stop instead of raw escape byte
-    expectSendPayload(ws, { sessionName: 'qwen-session', text: '/stop' });
+    // Transport sessions cancel the SDK turn directly instead of sending
+    // `/stop` as chat text.
+    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
+      sessionName: 'qwen-session',
+      text: '/stop',
+    }));
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
@@ -2375,10 +2620,11 @@ afterEach(() => {
     expect(stopBtn.textContent).toBe('■');
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
-    expectSendPayload(ws, {
+    expectCancelPayload(ws, { sessionName: 'codex-sdk-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'codex-sdk-session',
       text: '/stop',
-    });
+    }));
   });
 
   it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {
@@ -2692,6 +2938,58 @@ afterEach(() => {
 
     fireEvent.keyDown(input, { key: 'ArrowDown' });
     expect(input.textContent).toBe('draft text');
+  });
+
+  it('ignores input keyboard shortcuts while IME composition is active', async () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['session newest'],
+      sessionHistory: {
+        'my-session': ['session newest'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = '拼';
+    fireEvent.input(input);
+    input.dispatchEvent(new Event('compositionstart', { bubbles: true, cancelable: true }));
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('拼');
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    input.dispatchEvent(new Event('compositionend', { bubbles: true, cancelable: true }));
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('session newest');
+  });
+
+  it('ignores history navigation when keydown itself is marked composing', () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['session newest'],
+      sessionHistory: {
+        'my-session': ['session newest'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = 'pin';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'ArrowUp', isComposing: true, keyCode: 229 });
+    expect(input.textContent).toBe('pin');
   });
 
   it('closes @ picker if user keeps typing without making a selection', () => {
@@ -3040,9 +3338,141 @@ afterEach(() => {
     });
 
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    // R3 v2 PR-ρ/υ — attachment text-prefix keeps the short tag and
+    // maps it to the full daemon path so the LLM can open the file.
     expectSendPayload(ws, {
       sessionName: 'my-session',
-      text: '@/tmp/pasted-text.txt',
+      text: '#1:(/tmp/pasted-text.txt)',
+    });
+  });
+
+  /*
+   * R3 v2 PR-ρ — User feedback: "上传或者文件的时候, 要增加个 id-[number]
+   * 的功能, 方便发文字的时候引用那个文件" + "id 还是原来的 id 只是加一
+   * 个下划线和数字, 每次上传递增. 发送后从1重新开始. #1图片 #2图片
+   * 这样 llm 可以快速理解并引用图片". Each composer attachment now
+   * carries a sequential `seq` (1, 2, 3, ...) surfaced as a `#N`
+   * prefix in the badge AND folded into the send-payload text as
+   * `#N:(full path)` so the LLM can resolve each short reference to
+   * an actual readable file path. Counter resets on send (the
+   * attachments array is wiped by `clearComposer`).
+   */
+  it('R3 v2 PR-ρ/υ — multi-attachment uploads get sequential #N tags + full-path text references', async () => {
+    let nextDaemonPath = '/tmp/file-a.png';
+    uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    // Upload via paste — same code path as the file input but the
+    // ClipboardEvent lets us deliver fresh File objects on each call
+    // without re-defining a non-configurable `files` property on the
+    // hidden file input.
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+
+    const fileA = new File(['aaa'], 'screenshot.png', { type: 'image/png' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [fileA],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    });
+
+    nextDaemonPath = '/tmp/file-b.png';
+    const fileB = new File(['bbb'], 'logs.txt', { type: 'text/plain' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [fileB],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-2').textContent).toBe('#2');
+    });
+
+    input.textContent = 'compare #1 and #2';
+    fireEvent.input(input);
+
+    // Send → text should carry both #N:(full path) references in upload order.
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, {
+      sessionName: 'my-session',
+      text: '#1:(/tmp/file-a.png) #2:(/tmp/file-b.png) compare #1 and #2',
+    });
+
+    // After send the attachments array is wiped → counter naturally resets.
+    await waitFor(() => {
+      expect(screen.queryByTestId('attachment-tag-1')).toBeNull();
+    });
+    nextDaemonPath = '/tmp/file-c.png';
+    const fileC = new File(['ccc'], 'next.md', { type: 'text/markdown' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [fileC],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    });
+  });
+
+  it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {
+    let nextDaemonPath = '/tmp/x1.png';
+    uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+
+    // Upload three files via paste → #1, #2, #3.
+    for (const [i, name] of [[0, 'a.png'], [1, 'b.png'], [2, 'c.png']] as const) {
+      nextDaemonPath = `/tmp/x${i + 1}.png`;
+      fireEvent.paste(input, {
+        clipboardData: {
+          files: [new File([name], name)],
+          getData: () => '',
+        },
+      });
+      await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(i + 1));
+    }
+    await waitFor(() => expect(screen.getByTestId('attachment-tag-3').textContent).toBe('#3'));
+
+    // Remove the middle one (#2 → b.png) by clicking its remove button.
+    const badges = document.querySelectorAll('.attachment-badge');
+    expect(badges).toHaveLength(3);
+    const middleRemove = badges[1].querySelector('.attachment-badge-remove') as HTMLButtonElement;
+    fireEvent.click(middleRemove);
+
+    // Survivors renumber: a.png → #1, c.png → #2.
+    await waitFor(() => {
+      const remaining = document.querySelectorAll('.attachment-badge');
+      expect(remaining).toHaveLength(2);
+      expect(remaining[0].querySelector('[data-testid="attachment-tag-1"]')?.textContent).toBe('#1');
+      expect(remaining[0].querySelector('.attachment-badge-name')?.textContent).toBe('a.png');
+      expect(remaining[1].querySelector('[data-testid="attachment-tag-2"]')?.textContent).toBe('#2');
+      expect(remaining[1].querySelector('.attachment-badge-name')?.textContent).toBe('c.png');
     });
   });
 
@@ -3500,6 +3930,45 @@ afterEach(() => {
     });
   });
 
+  it('uses saved codex model preference as a legacy fallback for model-less codex-sdk sessions', () => {
+    localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^gpt-5.5$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^default$/i })).toBeNull();
+  });
+
+  it('does not let saved codex model preference override confirmed codex-sdk session metadata', () => {
+    localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^gpt-5.4$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^gpt-5.5$/i })).toBeNull();
+  });
+
   it('prefers dynamically discovered codex-sdk models over the static fallback list', async () => {
     const ws = makeWs();
     render(
@@ -3530,7 +3999,7 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
     fireEvent.click(screen.getAllByRole('button', { name: /gpt-5.5/i })[0]!);
 
     expectSendPayload(ws, {
@@ -3585,7 +4054,7 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
     expect(screen.getByRole('button', { name: /gpt-5.5/i })).toBeDefined();
   });
 

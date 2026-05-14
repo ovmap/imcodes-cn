@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "preact/hooks";
+import { useState, useEffect, useMemo, useRef } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
@@ -32,13 +32,20 @@ import {
   type CcPresetEntry,
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
-import type { CcPreset } from "@shared/cc-presets.js";
-import { GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
+import {
+  getCcPresetAvailableModelIds,
+  getCcPresetEffectiveModel,
+  normalizeCcPresetName,
+  type CcPreset,
+} from "@shared/cc-presets.js";
+import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
+import { loadCodexModelPreference } from "../codex-model-preference.js";
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
 const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
+const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
 
 interface Props {
@@ -46,6 +53,7 @@ interface Props {
   onClose: () => void;
   onSessionStarted: (sessionName: string) => void;
   isProviderConnected: (id: string) => boolean;
+  onToast?: (message: string) => void;
 }
 
 type AgentType =
@@ -67,11 +75,17 @@ interface RemoteSession {
   label: string;
 }
 
+interface PendingStart {
+  project: string;
+  sessionName: string;
+}
+
 export function NewSessionDialog({
   ws,
   onClose,
   onSessionStarted,
   isProviderConnected: _isProviderConnected,
+  onToast,
 }: Props) {
   const { t } = useTranslation();
   const [project, setProject] = useState("");
@@ -84,6 +98,7 @@ export function NewSessionDialog({
   const [thinking, setThinking] = useState<TransportEffortLevel>("high");
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>("");
+  const pendingStartRef = useRef<PendingStart | null>(null);
   const agentGroups = getSessionAgentGroups("new-session");
 
   // CC env presets
@@ -137,10 +152,11 @@ export function NewSessionDialog({
   });
   const persistPresetDraft = (): CcPresetEntry => {
     const preset = buildCcPresetFromDraft(buildCurrentPresetDraft());
-    const updated = [...ccPresets.filter((p) => p.name !== preset.name), preset];
+    const presetKey = normalizeCcPresetName(preset.name);
+    const updated = [...ccPresets.filter((p) => normalizeCcPresetName(p.name) !== presetKey), preset];
     setCcPresets(updated);
     try {
-      ws?.send({ type: CC_PRESET_MSG.SAVE, presets: updated });
+      ws?.send({ type: CC_PRESET_MSG.SAVE, requestId: `cc-preset-save-${Date.now()}`, presets: updated });
     } catch {}
     return preset;
   };
@@ -149,9 +165,34 @@ export function NewSessionDialog({
     [ccPreset, ccPresets],
   );
   const qwenPresetModels = useMemo(
-    () => selectedCcPreset?.availableModels?.map((item) => item.id) ?? [],
+    () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
+  const importPresetFromClipboard = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      const parsed = JSON.parse(await navigator.clipboard.readText()) as CcPresetEntry;
+      if (!parsed || typeof parsed.name !== 'string' || !parsed.env || typeof parsed.env !== 'object') {
+        throw new Error('Invalid preset JSON');
+      }
+      applyPresetDraft(createCcPresetDraftFromPreset(parsed));
+      setCcPreset(parsed.name);
+      setShowPresetEditor(true);
+      setPresetError('');
+    } catch {
+      setPresetError(t('new_session.api_provider_import_error'));
+    }
+  };
+  const exportPresetToClipboard = async (preset: CcPresetEntry) => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(JSON.stringify(preset, null, 2));
+      setPresetError('');
+      onToast?.(t('new_session.api_provider_export_success'));
+    } catch {
+      setPresetError(t('new_session.api_provider_export_error'));
+    }
+  };
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>("new");
@@ -186,17 +227,17 @@ export function NewSessionDialog({
       if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
         setDiscoveringPreset(false);
         if (msg.preset) {
+          const presetKey = normalizeCcPresetName(msg.preset.name);
           setCcPresets((current) => [
-            ...current.filter((preset) => preset.name !== msg.preset?.name),
+            ...current.filter((preset) => normalizeCcPresetName(preset.name) !== presetKey),
             msg.preset,
           ].filter((preset): preset is CcPreset => preset !== undefined));
           if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
             applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
           }
           if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
-          const nextModel = msg.preset.defaultModel
-            ?? msg.preset.availableModels?.[0]?.id
-            ?? msg.preset.env.ANTHROPIC_MODEL;
+          const nextModel = getCcPresetEffectiveModel(msg.preset)
+            ?? getCcPresetAvailableModelIds(msg.preset)[0];
           if (nextModel) setRequestedModel(nextModel);
         }
         setPresetError(msg.ok ? "" : (msg.error ?? "Failed to discover models"));
@@ -236,25 +277,51 @@ export function NewSessionDialog({
 
   // (openclaw fallback removed — show connect hint instead of auto-switching)
 
-  // Listen for session.event started/error while dialog is open
+  // Listen while the dialog is mounted. A fast daemon can emit "started"
+  // before a starting-gated effect gets registered.
   useEffect(() => {
-    if (!ws || !starting) return;
+    if (!ws) return;
+    const finishStart = (sessionName: string) => {
+      pendingStartRef.current = null;
+      setError("");
+      setStarting(false);
+      onSessionStarted(sessionName);
+      onClose();
+    };
+    const matchesPendingSession = (name: string, pending: PendingStart) =>
+      name === pending.sessionName;
+    const matchesPendingProject = (value: unknown, pending: PendingStart) =>
+      typeof value === "string" && sanitizeProjectName(value) === pending.project;
     const unsub = ws.onMessage((msg) => {
+      const pending = pendingStartRef.current;
+      if (!pending) return;
       if (msg.type === "session.event") {
         const name = msg.session ?? "";
-        const slug = sanitizeProjectName(project);
-        if (msg.event === "started" && name.startsWith(`deck_${slug}_`)) {
-          unsub();
-          onSessionStarted(name);
-          onClose();
-        } else if (msg.event === "error" && name.startsWith(`deck_${slug}_`)) {
-          unsub();
+        if (msg.event === "started" && matchesPendingSession(name, pending)) {
+          finishStart(name);
+        } else if (msg.event === "error" && matchesPendingSession(name, pending)) {
+          pendingStartRef.current = null;
           setError(`Session failed to start: ${msg.state}`);
           setStarting(false);
         }
       }
+      if (msg.type === "session_list") {
+        const started = msg.sessions.find((session) =>
+          session.state !== "stopped" &&
+          (
+            session.name === pending.sessionName ||
+            (
+              session.role === "brain" &&
+              !session.name.startsWith("deck_sub_") &&
+              matchesPendingProject(session.project, pending)
+            )
+          )
+        );
+        if (started) finishStart(started.name);
+      }
       if (msg.type === "session.error") {
-        unsub();
+        if (!matchesPendingProject(msg.project, pending)) return;
+        pendingStartRef.current = null;
         setError(
           (msg as unknown as { message: string }).message ||
             "Failed to start session",
@@ -263,18 +330,22 @@ export function NewSessionDialog({
       }
     });
 
-    // Timeout after 15s
+    return unsub;
+  }, [ws, onClose, onSessionStarted]);
+
+  useEffect(() => {
+    if (!ws || !starting) return;
     const timeout = setTimeout(() => {
-      unsub();
-      setError(t("new_session.timeout"));
-      setStarting(false);
+      if (!pendingStartRef.current) return;
+      try {
+        ws.requestSessionList();
+      } catch {
+        /* best-effort probe; keep waiting for authoritative daemon state */
+      }
     }, 15_000);
 
-    return () => {
-      unsub();
-      clearTimeout(timeout);
-    };
-  }, [starting, ws, project]);
+    return () => clearTimeout(timeout);
+  }, [starting, ws]);
 
   const handleStart = () => {
     if (!project.trim()) {
@@ -294,6 +365,11 @@ export function NewSessionDialog({
       return;
     }
 
+    const slug = sanitizeProjectName(project.trim());
+    pendingStartRef.current = {
+      project: slug,
+      sessionName: `deck_${slug}_brain`,
+    };
     setError("");
     setStarting(true);
     if (shellBin)
@@ -323,6 +399,7 @@ export function NewSessionDialog({
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
         (agentType === "claude-code-sdk"
+          || agentType === "codex-sdk"
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
@@ -367,6 +444,7 @@ export function NewSessionDialog({
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
   const supportsModelSelection =
     agentType === "claude-code-sdk"
+    || agentType === "codex-sdk"
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
@@ -376,22 +454,34 @@ export function NewSessionDialog({
     : null;
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const modelSuggestions = useMemo(() => {
+    if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
       return agentType === "gemini-sdk"
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
         : dynamicModelIds;
     }
-    if (agentType === "qwen") {
-      return qwenPresetModels.length > 0
-        ? qwenPresetModels
-        : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []);
-    }
+    if (agentType === "qwen") return qwenPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
+    if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
   }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
+
+  useEffect(() => {
+    if (agentType !== "codex-sdk") return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const stored = loadCodexModelPreference();
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
+        return transportModels.defaultModel;
+      }
+      return trimmed;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
   useEffect(() => {
     setThinking("high");
@@ -399,8 +489,7 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (agentType !== "qwen") return;
-    const fallbackModel =
-      selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? "";
+    const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? "") : "";
     setRequestedModel((current) => {
       if (modelSuggestions.length === 0) {
         return current || fallbackModel;
@@ -698,14 +787,14 @@ export function NewSessionDialog({
                   <option value="">
                     {t("new_session.api_provider_default")}
                   </option>
-                  {ccPresets.map((p) => (
-                    <option key={p.name} value={p.name}>
-                      {p.name}
-                      {(p.defaultModel ?? p.env["ANTHROPIC_MODEL"])
-                        ? ` (${p.defaultModel ?? p.env["ANTHROPIC_MODEL"]})`
-                        : ""}
-                    </option>
-                  ))}
+	                  {ccPresets.map((p) => (
+	                    <option key={p.name} value={p.name}>
+	                      {p.name}
+	                      {getCcPresetEffectiveModel(p)
+	                        ? ` (${getCcPresetEffectiveModel(p)})`
+	                        : ""}
+	                    </option>
+	                  ))}
                 </select>
               )}
               {ccPresets.length === 0 && !showPresetEditor && (
@@ -1027,6 +1116,22 @@ export function NewSessionDialog({
                 </button>
                 <button
                   type="button"
+                  style={{
+                    background: "#334155",
+                    border: "none",
+                    color: "#fff",
+                    padding: "4px 12px",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    fontSize: 12,
+                    marginLeft: 8,
+                  }}
+                  onClick={() => { void importPresetFromClipboard(); }}
+                >
+                  {t('new_session.api_provider_import_json')}
+                </button>
+                <button
+                  type="button"
                   disabled={
                     discoveringPreset
                     || !newPresetName.trim()
@@ -1104,10 +1209,10 @@ export function NewSessionDialog({
                         }}
                       >
                         <span style={{ color: "#e2e8f0" }}>
-                          {p.name}{" "}
-                          <span style={{ color: "#475569" }}>
-                            {p.env["ANTHROPIC_MODEL"] ?? ""}
-                          </span>
+	                          {p.name}{" "}
+	                          <span style={{ color: "#475569" }}>
+	                            {getCcPresetEffectiveModel(p) ?? ""}
+	                          </span>
                         </span>
                         <div style={{ display: "flex", gap: 4 }}>
                           <button
@@ -1135,21 +1240,35 @@ export function NewSessionDialog({
                               cursor: "pointer",
                               fontSize: 11,
                             }}
-                            onClick={() => {
-                              const updated = ccPresets.filter(
-                                (x) => x.name !== p.name,
-                              );
+	                            onClick={() => {
+	                              const updated = ccPresets.filter(
+	                                (x) => normalizeCcPresetName(x.name) !== normalizeCcPresetName(p.name),
+	                              );
                               setCcPresets(updated);
                               try {
-                                ws?.send({
-                                  type: CC_PRESET_MSG.SAVE,
-                                  presets: updated,
-                                });
+	                                ws?.send({
+	                                  type: CC_PRESET_MSG.SAVE,
+	                                  requestId: `cc-preset-save-${Date.now()}`,
+	                                  presets: updated,
+	                                });
                               } catch {}
                               if (ccPreset === p.name) setCcPreset("");
                             }}
+	                          >
+	                            Delete
+	                          </button>
+                          <button
+                            type="button"
+                            style={{
+                              background: "none",
+                              border: "none",
+                              color: "#22c55e",
+                              cursor: "pointer",
+                              fontSize: 11,
+                            }}
+                            onClick={() => { void exportPresetToClipboard(p); }}
                           >
-                            Delete
+                            {t('new_session.api_provider_export_json')}
                           </button>
                         </div>
                       </div>

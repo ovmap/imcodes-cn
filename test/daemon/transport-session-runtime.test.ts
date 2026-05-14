@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
+import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -31,8 +33,17 @@ function makeMockProvider() {
 
   const fireDelta = (sid: string) =>
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
-  const fireComplete = (sid: string) =>
-    completeCb?.(sid, { id: 'msg-1', sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
+  const fireComplete = (sid: string, overrides: Partial<AgentMessage> = {}) =>
+    completeCb?.(sid, {
+      id: 'msg-1',
+      sessionId: sid,
+      kind: 'text',
+      role: 'assistant',
+      content: 'done',
+      timestamp: Date.now(),
+      status: 'complete',
+      ...overrides,
+    } as AgentMessage);
   const fireError = (sid: string, err?: ProviderError) =>
     errorCb?.(sid, err ?? { code: 'PROVIDER_ERROR', message: 'err', recoverable: false });
   const fireApproval = (sid: string, req: { id: string; description: string; tool?: string }) =>
@@ -146,6 +157,139 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('injects stable preference context only once per provider conversation', async () => {
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+
+    runtime.send('first preference-aware turn', 'pref-once-1', undefined, preferencePreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('second preference-aware turn', 'pref-once-2', undefined, preferencePreamble);
+    await flushDispatch();
+
+    const firstPayload = mock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    const secondPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    expect(firstPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(firstPayload.assembledMessage)).toContain('Use pnpm');
+    expect(secondPayload.messagePreamble).toBeUndefined();
+    expect(secondPayload.assembledMessage).toBe('second preference-aware turn');
+  });
+
+  it('does not attach preference context to control messages and re-injects it after compaction', async () => {
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+
+    runtime.send('first preference-aware turn', 'pref-compact-1', undefined, preferencePreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('/compact', 'pref-compact-control', undefined, preferencePreamble);
+    await flushDispatch();
+    const compactPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    expect(compactPayload.userMessage).toBe('/compact');
+    expect(compactPayload.messagePreamble).toBeUndefined();
+    expect(compactPayload.assembledMessage).toBe('/compact');
+
+    mock.fireComplete('sess-1', {
+      kind: 'system',
+      role: 'system',
+      content: 'Codex context compacted.',
+      metadata: { provider: 'codex-sdk', [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
+    });
+    await flushDispatch();
+
+    runtime.send('after compact', 'pref-compact-2', undefined, preferencePreamble);
+    await flushDispatch();
+    const afterCompactPayload = mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>;
+    expect(afterCompactPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(afterCompactPayload.assembledMessage)).toContain('Use pnpm');
+  });
+
+  it('rejects /compact before dispatch when provider compact capability is unsupported', () => {
+    (mock.provider.capabilities as Record<string, unknown>).compact = {
+      execution: 'unsupported',
+      verified: false,
+      completion: 'none',
+      cancellation: 'none',
+      reason: 'mock provider does not support compact',
+    };
+
+    expect(() => runtime.send('/compact')).toThrow('mock provider does not support compact');
+    expect(mock.provider.send).not.toHaveBeenCalled();
+  });
+
+  it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory: {
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: 'normalized-payload',
+        items: [makeSearchItem({ id: 'startup-memory', summary: 'Startup memory must not ride with slash controls' })],
+        injectedText: 'Historical context that must not be attached to /compact',
+      } as any,
+    }));
+    await r.initialize({
+      ...defaultConfig,
+      description: 'Session description must not be attached to /compact',
+      systemPrompt: 'Runtime system prompt must not be attached to /compact',
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+    timelineEmitterEmitMock.mockClear();
+    searchLocalMemorySemanticMock.mockClear();
+
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Prefer pnpm\n${PREFERENCE_CONTEXT_END}`;
+    r.send('/compact', 'raw-compact-control', undefined, preferencePreamble);
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    const compactPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, any>;
+    expect(compactPayload.userMessage).toBe('/compact');
+    expect(compactPayload.assembledMessage).toBe('/compact');
+    expect(compactPayload.systemText).toBeUndefined();
+    expect(compactPayload.messagePreamble).toBeUndefined();
+    expect(compactPayload.startupMemory).toBeUndefined();
+    expect(compactPayload.memoryRecall).toBeUndefined();
+    expect(compactPayload.context?.systemText).toBeUndefined();
+    expect(compactPayload.context?.messagePreamble).toBeUndefined();
+    expect(compactPayload.context?.requiredAuthoredContext).toEqual([]);
+    expect(compactPayload.context?.advisoryAuthoredContext).toEqual([]);
+  });
+
+  it('keeps queued preference context in messagePreamble without changing user-visible text', async () => {
+    runtime.send('first');
+    await flushDispatch();
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+    expect(runtime.send('second', 'msg-queued-2', undefined, preferencePreamble)).toBe('queued');
+
+    expect(runtime.pendingMessages).toEqual(['second']);
+    expect(runtime.pendingEntries).toEqual([
+      {
+        clientMessageId: 'msg-queued-2',
+        text: 'second',
+        messagePreamble: preferencePreamble,
+      },
+    ]);
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'second',
+      assembledMessage: expect.stringContaining('Use pnpm'),
+      messagePreamble: expect.stringContaining('Use pnpm'),
+    }));
   });
 
   it('tracks the active dispatch payload for restart-based replay', async () => {
@@ -1058,5 +1202,96 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.sending).toBe(true);
     mock.fireComplete('sess-1');
     expect(runtime.sending).toBe(false);
+  });
+
+  // ── N1 + G1 regression suite (audit f395d49c-78c) ─────────────────────────
+  //
+  // T5 — `_drainPending` MUST set `_sending=true` BEFORE invoking `_onDrain`.
+  //      Pre-fix the order was splice → onDrain (with _sending still false) →
+  //      _dispatchTurn (sets _sending=true). Any synchronous re-entrant
+  //      `runtime.send` from an onDrain listener would have seen _sending=false
+  //      and started a parallel dispatch, racing the merged turn. Node's
+  //      EventEmitter doesn't currently yield, so the race wasn't triggerable,
+  //      but the contract is now hardened for future refactors.
+  //
+  // T6 — `runtime.onDrain` MUST receive the full PendingTransportMessage[]
+  //      array (one entry per original user message) so that the
+  //      session-manager-registered callback in `wireTransportCallbacks` can
+  //      emit one `user.message` timeline event per entry. Three audit rounds
+  //      misread this contract before confirming it; the test locks it down
+  //      so future refactors cannot silently merge entries before timeline
+  //      emission and reintroduce the G1 "merged turn drops user messages"
+  //      bug 3 candidate.
+
+  it('T5 (N1 contract): _drainPending sets `_sending=true` before invoking the onDrain callback', async () => {
+    // Establish active turn so subsequent sends queue.
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued-a', 'cmd-a');
+    runtime.send('queued-b', 'cmd-b');
+    expect(runtime.pendingCount).toBe(2);
+
+    // Register onDrain to capture `runtime.sending` at the moment the
+    // callback fires. Pre-fix this would be `false` (race window).
+    let sendingDuringDrain: boolean | null = null;
+    runtime.onDrain = (messages) => {
+      sendingDuringDrain = runtime.sending;
+      // sanity — drain payload still matches the contract used by T6 below
+      expect(messages).toHaveLength(2);
+    };
+
+    // Complete the active turn — onComplete → _drainPending → onDrain.
+    mock.fireComplete('sess-1');
+
+    expect(sendingDuringDrain).toBe(true);
+  });
+
+  it('T6 (G1 contract): onDrain receives per-entry PendingTransportMessage[] with original clientMessageIds intact', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued-a', 'cmd-a');
+    runtime.send('queued-b', 'cmd-b');
+    runtime.send('queued-c', 'cmd-c');
+    expect(runtime.pendingCount).toBe(3);
+
+    let received: { messages: PendingTransportMessage[]; merged: string; count: number } | null = null;
+    runtime.onDrain = (messages, merged, count) => {
+      // Snapshot so test assertions can run after fireComplete returns.
+      received = { messages: messages.map((entry) => ({ ...entry })), merged, count };
+    };
+
+    mock.fireComplete('sess-1');
+
+    expect(received).not.toBeNull();
+    const captured = received!;
+    expect(captured.count).toBe(3);
+    expect(captured.messages.map((entry) => entry.clientMessageId)).toEqual(['cmd-a', 'cmd-b', 'cmd-c']);
+    expect(captured.messages.map((entry) => entry.text)).toEqual(['queued-a', 'queued-b', 'queued-c']);
+    // The merged string also matches the join used by _drainPending.
+    expect(captured.merged).toBe('queued-a\n\nqueued-b\n\nqueued-c');
+  });
+
+  it('T5b (N1 contract): synchronous re-entrant runtime.send from onDrain listener queues into pending, never starts a parallel turn', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued', 'cmd-queued');
+
+    const earlierProviderSendCalls = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    let reentrantResult: 'sent' | 'queued' | null = null;
+    runtime.onDrain = () => {
+      // A listener that synchronously re-enters runtime.send must NOT start
+      // a parallel dispatch — `_sending` is already true (T5 contract).
+      reentrantResult = runtime.send('re-entrant', 'cmd-reentrant');
+    };
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(reentrantResult).toBe('queued');
+    // The re-entrant entry now sits in _pendingMessages, separate from the
+    // merged drain turn that fired.
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toContain('cmd-reentrant');
+    // provider.send called once more (the merged drain turn), NOT twice.
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(earlierProviderSendCalls + 1);
   });
 });

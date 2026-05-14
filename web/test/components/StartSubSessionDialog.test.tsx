@@ -30,6 +30,7 @@ const makeWs = () => ({
 
 describe('StartSubSessionDialog', () => {
   afterEach(() => {
+    localStorage.clear();
     cleanup();
   });
 
@@ -118,6 +119,30 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
+  });
+
+  it('passes requestedModel for codex-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.5' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.5',
+      thinking: 'high',
+    });
   });
 
   it('clicking the backdrop does not call onClose', () => {
@@ -231,6 +256,54 @@ describe('StartSubSessionDialog', () => {
       requestedModel: 'MiniMax-M2.7',
       thinking: 'high',
     });
+  });
+
+  it('shows a toast when qwen sub-session preset JSON is copied to the clipboard', async () => {
+    const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWriteText },
+    });
+    const onToast = vi.fn();
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+          },
+        ],
+      });
+      return () => {};
+    });
+
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+        onToast={onToast}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'api_provider_export_json' }));
+
+    await waitFor(() => {
+      expect(clipboardWriteText).toHaveBeenCalledOnce();
+    });
+    expect(JSON.parse(clipboardWriteText.mock.calls[0][0])).toMatchObject({ name: 'MiniMax' });
+    expect(onToast).toHaveBeenCalledWith('api_provider_export_success');
   });
 
   it('prefills default qwen preset values instead of leaving placeholders only', async () => {

@@ -307,6 +307,7 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
 
     await connectProvider("cursor-headless", {});
     await restoreTransportSessions("cursor-headless");
+    await flush();
 
     const runtime = getTransportRuntime("deck_cursor_restore_brain");
     expect(runtime?.providerSessionId).toBe("route-cursor-restore");
@@ -351,7 +352,7 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     expect(mocks.copilotRuns).toContainEqual(
       expect.objectContaining({
         sessionId: "copilot-session-restore",
-        prompt: "Verify copilot restore",
+        prompt: expect.stringContaining("Verify copilot restore"),
       }),
     );
   }, 10_000);

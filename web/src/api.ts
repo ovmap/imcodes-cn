@@ -7,7 +7,13 @@
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import type {
+  TimelineCursor,
+  TimelineDetailRef,
+  TimelinePayloadMetadata,
+} from '@shared/timeline-protocol.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
+import type { AuthoredContextScope } from '@shared/memory-scope.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import { isNative } from './native.js';
 import {
@@ -474,6 +480,16 @@ export async function sendSessionViaHttp(
   });
 }
 
+export async function cancelSessionViaHttp(
+  serverId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/cancel`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 function isRetryableNonceExchangeError(error: unknown): boolean {
   if (error instanceof ApiError) {
     if (error.code === 'invalid_or_expired_nonce') return false;
@@ -769,7 +785,17 @@ export async function fetchTimelineHistoryHttp(
   serverId: string,
   sessionName: string,
   opts: { afterTs?: number; beforeTs?: number; limit?: number } = {},
-): Promise<{ events: unknown[]; epoch: number | null; hasMore: boolean; nextCursor: number | null } | null> {
+): Promise<(
+  Omit<TimelinePayloadMetadata, 'nextCursor' | 'detailRefs'>
+  & {
+    events: unknown[];
+    epoch: number | null;
+    hasMore: boolean;
+    nextCursor: TimelineCursor | null;
+    legacyBeforeTs?: number;
+    detailRefs?: TimelineDetailRef[];
+  }
+) | null> {
   const params = new URLSearchParams();
   params.set('sessionName', sessionName);
   if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
@@ -781,8 +807,21 @@ export async function fetchTimelineHistoryHttp(
       sessionName: string;
       epoch: number | null;
       events: unknown[];
-      hasMore: boolean;
-      nextCursor: number | null;
+      hasMore?: boolean;
+      nextCursor?: TimelineCursor | number | null;
+      legacyBeforeTs?: number;
+      earliestTs?: number;
+      status?: TimelinePayloadMetadata['status'];
+      errorReason?: string;
+      source?: TimelinePayloadMetadata['source'];
+      payloadBytes?: number;
+      actualPayloadBytes?: number;
+      payloadTruncated?: boolean;
+      cursorReset?: boolean;
+      droppedEvents?: number;
+      truncatedEvents?: number;
+      detailRefs?: TimelineDetailRef[];
+      recoverable?: boolean;
     }>(`/api/server/${encodeURIComponent(serverId)}/timeline/history/full?${params.toString()}`, {
       method: 'GET',
       signal: timeout.signal,
@@ -791,7 +830,25 @@ export async function fetchTimelineHistoryHttp(
       events: Array.isArray(result.events) ? result.events : [],
       epoch: result.epoch ?? null,
       hasMore: !!result.hasMore,
-      nextCursor: result.nextCursor ?? null,
+      nextCursor: result.nextCursor && typeof result.nextCursor === 'object' ? result.nextCursor : null,
+      legacyBeforeTs: typeof result.nextCursor === 'number'
+        ? result.nextCursor
+        : typeof result.legacyBeforeTs === 'number'
+          ? result.legacyBeforeTs
+          : typeof result.earliestTs === 'number'
+            ? result.earliestTs
+            : undefined,
+      status: result.status,
+      errorReason: result.errorReason,
+      source: result.source,
+      payloadBytes: result.payloadBytes,
+      actualPayloadBytes: result.actualPayloadBytes,
+      payloadTruncated: result.payloadTruncated,
+      cursorReset: result.cursorReset,
+      droppedEvents: result.droppedEvents,
+      truncatedEvents: result.truncatedEvents,
+      detailRefs: Array.isArray(result.detailRefs) ? result.detailRefs : undefined,
+      recoverable: result.recoverable,
     };
   } catch (err) {
     // 401/403 → let it propagate (auth handler already runs in apiFetch).
@@ -1242,7 +1299,7 @@ export interface SharedProject {
   workspaceId: string | null;
   canonicalRepoId: string;
   displayName: string | null;
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: AuthoredContextScope;
   status: 'unenrolled' | 'active' | 'pending_removal' | 'removed';
 }
 
@@ -1258,6 +1315,7 @@ export interface SharedDocumentVersion {
   id: string;
   versionNumber: number;
   status: string;
+  createdByUserId?: string;
 }
 
 export interface SharedDocument {
@@ -1265,6 +1323,7 @@ export interface SharedDocument {
   enterpriseId: string;
   kind: 'coding_standard' | 'architecture_guideline' | 'repo_playbook' | 'knowledge_doc';
   title: string;
+  createdByUserId?: string;
   versions: SharedDocumentVersion[];
 }
 
@@ -1279,13 +1338,14 @@ export interface SharedDocumentBinding {
   applicabilityLanguage: string | null;
   applicabilityPathPattern: string | null;
   status: string;
+  createdByUserId?: string;
 }
 
 export interface RuntimeAuthoredContextBindingView {
   bindingId: string;
   documentVersionId: string;
   mode: 'required' | 'advisory';
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: AuthoredContextScope;
   repository?: string;
   language?: string;
   pathPattern?: string;
@@ -1400,7 +1460,7 @@ export async function enrollSharedProject(
     canonicalRepoId: string;
     displayName?: string;
     workspaceId?: string | null;
-    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    scope: AuthoredContextScope;
   },
 ): Promise<{ id: string }> {
   return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/projects/enroll`, {

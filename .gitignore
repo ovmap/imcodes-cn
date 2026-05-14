@@ -26,6 +26,7 @@ scripts/sync-to-remote.sh
 
 # Discussion and plans (private)
 docs/plan/
+docs/study/
 
 # Claude Code skills/agents cache
 web/.agents/

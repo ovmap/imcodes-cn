@@ -11,11 +11,13 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
  *   'modal' — rendered as a full-screen overlay dialog
  *   'panel' — rendered inline (no overlay), fits inside a parent container
  */
-import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
@@ -27,6 +29,7 @@ import {
   __resetSharedChangesForTests,
   type ChangeFile,
 } from '../git-status-store.js';
+import { filePreviewStatesEqual } from '../file-preview-state.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -263,15 +266,16 @@ export function mergePreviewState(
   if (!currentPath || !incomingPath || currentPath !== incomingPath) return incoming;
   if (incoming.status === 'loading') return current;
   if (current.status === 'ok' && incoming.status === 'ok') {
-    return {
+    const merged: FileBrowserPreviewState = {
       ...current,
       ...incoming,
       diff: incoming.diff ?? current.diff,
       diffHtml: incoming.diffHtml ?? current.diffHtml,
       downloadId: incoming.downloadId ?? current.downloadId,
     };
+    return filePreviewStatesEqual(current, merged) ? current : merged;
   }
-  return incoming;
+  return filePreviewStatesEqual(current, incoming) ? current : incoming;
 }
 
 /** File extensions that can be previewed with office document libraries. */
@@ -313,6 +317,9 @@ function buildVideoStreamUrl(serverId: string, downloadId: string): string {
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const PREVIEW_REQUEST_TIMEOUT_MS = 22_000;
+const PREVIEW_REFRESH_INTERVAL_MS = 8_000;
+const PREVIEW_REFRESH_FAILURE_BACKOFF_MS = 30_000;
 
 function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): FsNode[] {
   return nodes.map((n) => {
@@ -322,11 +329,39 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
-type PendingPreviewRequest = { path: string; cycleId: number };
+type PendingPreviewReason = 'interactive' | 'refresh';
+type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
+type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
+type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | 'source' | 'diff' | 'edit';
+type PreviewScrollSnapshot = { key: string; scrollTop: number; scrollLeft: number };
+
+function previewCycleKey(path: string, cycleId: number): string {
+  return `${cycleId}\0${path}`;
+}
+
+function getPreviewScrollMode(
+  preview: FileBrowserPreviewState,
+  isEditing: boolean,
+  showDiff: boolean,
+  canRenderDiff: boolean,
+): PreviewScrollMode | null {
+  if (preview.status === 'idle') return null;
+  if (preview.status === 'ok') {
+    if (isEditing) return 'edit';
+    return showDiff && canRenderDiff ? 'diff' : 'source';
+  }
+  return preview.status;
+}
+
+function previewScrollKey(path: string, mode: PreviewScrollMode): string {
+  return `${mode}\0${path}`;
+}
 
 /** Backward-compat re-export so the existing FileBrowser test suite keeps
  *  working after the shared-changes cache moved to `git-status-store.ts`. */
 export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTests;
+
+type NewEntryKind = 'file' | 'folder';
 
 export function FileBrowser({
   ws,
@@ -371,6 +406,8 @@ export function FileBrowser({
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
+  const previewRef = useRef<FileBrowserPreviewState>(preview);
+  useEffect(() => { previewRef.current = preview; }, [preview]);
   const [showDiff, setShowDiff] = useState(() => {
     if (initialPreview?.status === 'ok' && initialPreview.diffHtml && autoPreviewPreferDiff) return true;
     return false;
@@ -399,8 +436,8 @@ export function FileBrowser({
     return () => { editorMsgHandlers.current.delete(handler); };
   }, []);
 
-  const [newFolderParent, setNewFolderParent] = useState<string | null>(null);
-  const [newFolderName, setNewFolderName] = useState('');
+  const [newEntry, setNewEntry] = useState<{ kind: NewEntryKind; parentPath: string } | null>(null);
+  const [newEntryName, setNewEntryName] = useState('');
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
@@ -428,7 +465,13 @@ export function FileBrowser({
   const pendingReadRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
   const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
+  const pendingPreviewTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const previewRefreshBackoffUntilRef = useRef(0);
+  const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
+  const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
+  const previewContentRef = useRef<HTMLDivElement | null>(null);
+  const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
   const previewTabOverridePathRef = useRef<string | null>(null);
@@ -448,7 +491,11 @@ export function FileBrowser({
       pendingReadRef.current.clear();
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
+      for (const timer of pendingPreviewTimersRef.current.values()) clearTimeout(timer);
+      pendingPreviewTimersRef.current.clear();
+      pendingPreviewDiffRef.current.clear();
       pendingMkdirRef.current.clear();
+      pendingCreateFileRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
@@ -478,6 +525,49 @@ export function FileBrowser({
     }
     return false;
   }, [getActivePreviewCycle]);
+
+  const clearPendingPreviewRequest = useCallback((kind: 'read' | 'diff', requestId: string): PendingPreviewRequest | null => {
+    const pending = kind === 'read' ? pendingReadRef.current : pendingGitDiffRef.current;
+    const request = pending.get(requestId) ?? null;
+    pending.delete(requestId);
+    const timer = pendingPreviewTimersRef.current.get(requestId);
+    if (timer) clearTimeout(timer);
+    pendingPreviewTimersRef.current.delete(requestId);
+    return request;
+  }, []);
+
+  const clearAllPendingPreviewRequests = useCallback(() => {
+    pendingReadRef.current.clear();
+    pendingGitDiffRef.current.clear();
+    for (const timer of pendingPreviewTimersRef.current.values()) clearTimeout(timer);
+    pendingPreviewTimersRef.current.clear();
+  }, []);
+
+  const handlePreviewRequestTimeout = useCallback((kind: 'read' | 'diff', requestId: string) => {
+    const request = clearPendingPreviewRequest(kind, requestId);
+    if (!request || !mountedRef.current) return;
+    if (request.reason === 'refresh') {
+      previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
+      return;
+    }
+    if (kind === 'diff') return;
+    const active = getActivePreviewCycle();
+    if (!active || active.path !== request.path || active.cycleId !== request.cycleId) return;
+    activePreviewCycleRef.current = null;
+    setPreview({ status: 'error', path: request.path, error: t('file_browser.preview_error') });
+  }, [clearPendingPreviewRequest, getActivePreviewCycle, t]);
+
+  const trackPendingPreviewRequest = useCallback((
+    kind: 'read' | 'diff',
+    requestId: string,
+    request: PendingPreviewRequest,
+  ) => {
+    clearPendingPreviewRequest(kind, requestId);
+    const pending = kind === 'read' ? pendingReadRef.current : pendingGitDiffRef.current;
+    pending.set(requestId, { ...request, startedAt: Date.now() });
+    const timer = setTimeout(() => handlePreviewRequestTimeout(kind, requestId), PREVIEW_REQUEST_TIMEOUT_MS);
+    pendingPreviewTimersRef.current.set(requestId, timer);
+  }, [clearPendingPreviewRequest, handlePreviewRequestTimeout]);
 
   const fetchDir = useCallback((nodePath: string) => {
     if (loadedRef.current.has(nodePath)) return;
@@ -525,9 +615,13 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
-        pendingReadRef.current.clear();
-        pendingGitDiffRef.current.clear();
+        clearAllPendingPreviewRequests();
+        pendingCreateFileRef.current.clear();
+        const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
+        if (loadingPath) {
+          setPreview({ status: 'error', path: loadingPath, error: t('file_browser.preview_error') });
+        }
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
         return;
@@ -597,7 +691,7 @@ export function FileBrowser({
       if (msg.type === 'fs.read_response') {
         const pending = pendingReadRef.current.get(msg.requestId);
         if (!pending) return;
-        pendingReadRef.current.delete(msg.requestId);
+        clearPendingPreviewRequest('read', msg.requestId);
         const active = getActivePreviewCycle();
         if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
         const filePath = pending.path;
@@ -607,12 +701,17 @@ export function FileBrowser({
         const dlId = msg.downloadId;
 
         if (msg.status === 'error') {
-          const errKey = msg.error === 'file_too_large' ? 'file_browser.preview_too_large'
-            : msg.error === 'forbidden_path' ? 'file_browser.preview_error'
+          if (pending.reason === 'refresh') {
+            previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
+            return;
+          }
+          const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
+            : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
           setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
           return;
         }
+        previewRefreshBackoffUntilRef.current = 0;
 
         // Video preview — daemon signals stream-mode (no inline content) and
         // we let <video> fetch the bytes via the HTTP download endpoint.
@@ -657,16 +756,42 @@ export function FileBrowser({
         }
         setEditContent(content);
 
+        const pendingDiff = pendingPreviewDiffRef.current.get(previewCycleKey(filePath, pending.cycleId));
         setPreview((prev) => {
-          // Merge diff if already fetched
           const existing = prev.status === 'ok' && prev.path === filePath ? prev : null;
-          return { status: 'ok', path: filePath, content, diff: existing?.diff, diffHtml: existing?.diffHtml, downloadId: dlId };
+          return {
+            status: 'ok',
+            path: filePath,
+            content,
+            diff: existing?.diff ?? pendingDiff?.diff,
+            diffHtml: existing?.diffHtml ?? pendingDiff?.diffHtml,
+            downloadId: dlId,
+          };
         });
+        pendingPreviewDiffRef.current.delete(previewCycleKey(filePath, pending.cycleId));
         return;
       }
 
       // Forward write responses to FileEditor component
       if (msg.type === 'fs.write_response') {
+        const pendingCreate = pendingCreateFileRef.current.get(msg.requestId);
+        if (pendingCreate) {
+          pendingCreateFileRef.current.delete(msg.requestId);
+          if (!mountedRef.current) return;
+          if (msg.status === 'error' || msg.status === 'conflict') {
+            setError(msg.error === FS_WRITE_ERROR.FILE_EXISTS ? t('file_browser.file_exists') : (msg.error ?? t('file_browser.create_file_failed')));
+            return;
+          }
+          loadedRef.current.delete(pendingCreate.parentPath);
+          setError(null);
+          fetchDir(pendingCreate.parentPath);
+          if (includeFiles) {
+            setPanelView('files');
+            setSelectedPaths(new Set([pendingCreate.targetPath]));
+            fetchPreview(msg.resolvedPath ?? pendingCreate.targetPath);
+          }
+          return;
+        }
         for (const h of editorMsgHandlers.current) h(msg);
         return;
       }
@@ -698,7 +823,7 @@ export function FileBrowser({
       if (msg.type === 'fs.git_diff_response') {
         const pending = pendingGitDiffRef.current.get(msg.requestId);
         if (!pending) return;
-        pendingGitDiffRef.current.delete(msg.requestId);
+        clearPendingPreviewRequest('diff', msg.requestId);
         const active = getActivePreviewCycle();
         if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
         const filePath = pending.path;
@@ -708,6 +833,18 @@ export function FileBrowser({
           const diffHtml = diff ? renderDiff(diff) : '';
           if (!diffHtml && previewTabOverridePathRef.current !== filePath) {
             setShowDiff(false);
+          }
+          const diffKey = previewCycleKey(filePath, pending.cycleId);
+          const currentPreview = previewRef.current;
+          if (diffHtml && !(currentPreview.status === 'ok' && currentPreview.path === filePath)) {
+            pendingPreviewDiffRef.current.set(diffKey, {
+              path: filePath,
+              cycleId: pending.cycleId,
+              diff,
+              diffHtml,
+            });
+          } else {
+            pendingPreviewDiffRef.current.delete(diffKey);
           }
           setPreview((prev) => {
             if (prev.status === 'ok' && prev.path === filePath) {
@@ -736,7 +873,7 @@ export function FileBrowser({
         return;
       }
     });
-  }, [fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (editDirtyRef.current) {
@@ -754,6 +891,7 @@ export function FileBrowser({
     setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
+    pendingPreviewDiffRef.current.clear();
     const active = getActivePreviewCycle(filePath);
     const cycleId = active && (hasPendingPreviewWork('read', filePath, active.cycleId) || hasPendingPreviewWork('diff', filePath, active.cycleId))
       ? active.cycleId
@@ -765,26 +903,49 @@ export function FileBrowser({
     onPreviewStateChange?.({ path: filePath, preferDiff, preview: loadingPreview });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
       const requestId = ws.fsReadFile(filePath);
-      pendingReadRef.current.set(requestId, { path: filePath, cycleId });
+      trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
     }
     if (!hasPendingPreviewWork('diff', filePath, cycleId)) {
       const diffId = ws.fsGitDiff(filePath);
-      pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
+      trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, ws]);
+  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
+
+  const buildChildPath = useCallback((parentPath: string, childName: string) => {
+    const sep = parentPath.includes('\\') ? '\\' : '/';
+    return `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${childName}`;
+  }, []);
 
   const requestMkdir = useCallback((parentPath: string, folderName: string) => {
     const trimmed = folderName.trim();
     if (!trimmed) return;
-    const sep = parentPath.includes('\\') ? '\\' : '/';
-    const fullPath = `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${trimmed}`;
+    const fullPath = buildChildPath(parentPath, trimmed);
     const requestId = ws.fsMkdir(fullPath);
     pendingMkdirRef.current.set(requestId, { parentPath, targetPath: fullPath });
-    setNewFolderParent(null);
-    setNewFolderName('');
-  }, [ws]);
+    setNewEntry(null);
+    setNewEntryName('');
+  }, [buildChildPath, ws]);
+
+  const requestCreateFile = useCallback((parentPath: string, fileName: string) => {
+    const trimmed = fileName.trim();
+    if (!trimmed) return;
+    const fullPath = buildChildPath(parentPath, trimmed);
+    const requestId = ws.fsWriteFile(fullPath, '', { createOnly: true });
+    pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+    setNewEntry(null);
+    setNewEntryName('');
+  }, [buildChildPath, ws]);
+
+  const requestNewEntry = useCallback(() => {
+    if (!newEntry) return;
+    if (newEntry.kind === 'folder') {
+      requestMkdir(newEntry.parentPath, newEntryName);
+      return;
+    }
+    requestCreateFile(newEntry.parentPath, newEntryName);
+  }, [newEntry, newEntryName, requestCreateFile, requestMkdir]);
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
@@ -834,8 +995,9 @@ export function FileBrowser({
       // Clear stale state from previous ws instance
       loadedRef.current.clear();
       pendingRef.current.clear();
-      pendingReadRef.current.clear();
-      pendingGitDiffRef.current.clear();
+      clearAllPendingPreviewRequests();
+      pendingCreateFileRef.current.clear();
+      pendingPreviewDiffRef.current.clear();
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
@@ -845,7 +1007,7 @@ export function FileBrowser({
       setError(null);
     }
     fetchDir(startPath);
-  }, [fetchDir, includeFiles, serverId, showHidden, startPath]);
+  }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, serverId, showHidden, startPath]);
 
   useEffect(() => {
     if (!changesRootPath) return;
@@ -912,15 +1074,17 @@ export function FileBrowser({
     if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
     previewTabOverridePathRef.current = null;
     activePreviewCycleRef.current = null;
+    clearAllPendingPreviewRequests();
+    pendingPreviewDiffRef.current.clear();
     setIsEditing(false);
     setEditDirty(false);
     setPreview({ status: 'idle' });
     if (autoPreviewPath && onClose) {
       onClose();
     }
-  }, [autoPreviewPath, editDirty, onClose, t]);
+  }, [autoPreviewPath, clearAllPendingPreviewRequests, editDirty, onClose, t]);
 
-  // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
+  // Auto-refresh preview content periodically when a file is being previewed (paused during editing).
   useEffect(() => {
     if (preview.status !== 'ok' && preview.status !== 'image') return;
     if (onPreviewFile) return; // external preview — don't poll here
@@ -928,17 +1092,21 @@ export function FileBrowser({
     const path = (preview as { path: string }).path;
     const timer = setInterval(() => {
       if (!mountedRef.current) return;
+      if (Date.now() < previewRefreshBackoffUntilRef.current) return;
+      if (hasPendingPreviewWork('read', path) || hasPendingPreviewWork('diff', path)) return;
       try {
         const cycleId = nextPreviewCycleIdRef.current++;
         activePreviewCycleRef.current = { path, cycleId };
         const reqId = ws.fsReadFile(path);
-        pendingReadRef.current.set(reqId, { path, cycleId });
-        const diffId = ws.fsGitDiff(path);
-        pendingGitDiffRef.current.set(diffId, { path, cycleId });
+        trackPendingPreviewRequest('read', reqId, { path, cycleId, reason: 'refresh' });
+        if (showDiff) {
+          const diffId = ws.fsGitDiff(path);
+          trackPendingPreviewRequest('diff', diffId, { path, cycleId, reason: 'refresh' });
+        }
       } catch { /* ws disconnected */ }
-    }, 5000);
+    }, PREVIEW_REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, showDiff, trackPendingPreviewRequest]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
@@ -1074,7 +1242,38 @@ export function FileBrowser({
     </div>
   );
 
-  const hasDiff = preview.status === 'ok' && !!preview.diff;
+  const hasDiff = preview.status === 'ok' && (!!preview.diff || !!preview.diffHtml);
+  const canRenderDiff = preview.status === 'ok' && !!preview.diffHtml;
+  const previewScrollMode = getPreviewScrollMode(preview, isEditing, showDiff, canRenderDiff);
+  const activePreviewScrollKey = previewScrollMode && preview.status !== 'idle'
+    ? previewScrollKey((preview as { path: string }).path, previewScrollMode)
+    : null;
+
+  useEffect(() => {
+    const el = previewContentRef.current;
+    if (!el || !activePreviewScrollKey) return;
+    const saveScroll = () => {
+      previewScrollSnapshotRef.current = {
+        key: activePreviewScrollKey,
+        scrollTop: el.scrollTop,
+        scrollLeft: el.scrollLeft,
+      };
+    };
+    saveScroll();
+    el.addEventListener('scroll', saveScroll, { passive: true });
+    return () => {
+      saveScroll();
+      el.removeEventListener('scroll', saveScroll);
+    };
+  }, [activePreviewScrollKey]);
+
+  useLayoutEffect(() => {
+    const el = previewContentRef.current;
+    const snapshot = previewScrollSnapshotRef.current;
+    if (!el || !activePreviewScrollKey || !snapshot || snapshot.key !== activePreviewScrollKey) return;
+    if (el.scrollTop !== snapshot.scrollTop) el.scrollTop = snapshot.scrollTop;
+    if (el.scrollLeft !== snapshot.scrollLeft) el.scrollLeft = snapshot.scrollLeft;
+  }, [activePreviewScrollKey, preview]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1218,7 +1417,7 @@ export function FileBrowser({
         }}>✕</button>
       </div>
       {/* Conflict dialog rendered inside FileEditor */}
-      <div class="fb-preview-content">
+      <div class="fb-preview-content" ref={previewContentRef}>
         {preview.status === 'loading' && (
           <div class="fb-preview-loading">
             <div class="fb-loading-spinner" />
@@ -1275,13 +1474,13 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && !showDiff && (
+        {preview.status === 'ok' && !isEditing && (!showDiff || !canRenderDiff) && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
             <FilePreviewPane content={preview.content} path={preview.path} />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && showDiff && preview.diffHtml && (
-          <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml }} />
+        {preview.status === 'ok' && !isEditing && showDiff && canRenderDiff && (
+          <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml ?? '' }} />
         )}
       </div>
     </div>
@@ -1444,38 +1643,43 @@ export function FileBrowser({
         <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
         {' ·'}
       </label>
+      {includeFiles && (
+        <button
+          class="fb-create-btn fb-create-file-btn"
+          title={t('chat.new_file')}
+          aria-label={t('chat.new_file')}
+          onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+        >＋</button>
+      )}
       <button
-        class="fb-new-folder-btn"
+        class="fb-create-btn fb-create-folder-btn"
         title={t('chat.new_folder')}
-        onClick={() => { setNewFolderParent(currentLabel); setNewFolderName(''); }}
-      >+</button>
+        aria-label={t('chat.new_folder')}
+        onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
+      >＋</button>
     </div>
   );
 
-  const newFolderDialog = newFolderParent !== null ? (
+  const newEntryDialog = newEntry !== null ? (
     <div class="fb-new-folder-bar">
       <input
         type="text"
-        placeholder={t('chat.new_folder_name')}
-        value={newFolderName}
-        onInput={(e) => setNewFolderName((e.target as HTMLInputElement).value)}
+        placeholder={newEntry.kind === 'folder' ? t('chat.new_folder_name') : t('chat.new_file_name')}
+        value={newEntryName}
+        onInput={(e) => setNewEntryName((e.target as HTMLInputElement).value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && newFolderName.trim()) {
-            requestMkdir(newFolderParent!, newFolderName);
-          }
-          if (e.key === 'Escape') setNewFolderParent(null);
+          if (e.key === 'Enter' && newEntryName.trim()) requestNewEntry();
+          if (e.key === 'Escape') setNewEntry(null);
         }}
         autoFocus
       />
       <button
         class="btn btn-primary"
         style={{ padding: '4px 10px', fontSize: 12 }}
-        disabled={!newFolderName.trim()}
-        onClick={() => {
-          requestMkdir(newFolderParent!, newFolderName);
-        }}
+        disabled={!newEntryName.trim()}
+        onClick={requestNewEntry}
       >{t('chat.create')}</button>
-      <button class="fb-close" onClick={() => setNewFolderParent(null)} style={{ fontSize: 12 }}>✕</button>
+      <button class="fb-close" onClick={() => setNewEntry(null)} style={{ fontSize: 12 }}>✕</button>
     </div>
   ) : null;
 
@@ -1505,7 +1709,7 @@ export function FileBrowser({
             {tabs}
             {previewPane ? (
               <div class="fb-body fb-body-split">
-                <div class="fb-tree fb-tree-split">{changesSection}</div>
+                <div class="fb-tree fb-tree-split fb-changes-tree">{changesSection}</div>
                 {previewPane}
               </div>
             ) : (
@@ -1522,7 +1726,7 @@ export function FileBrowser({
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
-          {newFolderDialog}
+          {newEntryDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
@@ -1559,7 +1763,7 @@ export function FileBrowser({
             <button class="fb-close" onClick={onClose}>✕</button>
           </div>
           {breadcrumb}
-          {newFolderDialog}
+          {newEntryDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             {tree}
             {previewPane}

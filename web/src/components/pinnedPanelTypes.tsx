@@ -20,6 +20,7 @@ import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { SharedContextManagementPanel } from './SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
@@ -57,7 +58,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
 
   const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
-  const modelDisplay = liveSub.modelDisplay ?? (liveSub.type === 'qwen' ? liveSub.qwenModel : undefined);
+  const modelDisplay = resolveEffectiveSessionModel(liveSub);
   const compactQuotaText = liveSub.type === 'codex' || liveSub.type === 'codex-sdk'
     ? ''
     : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
@@ -77,6 +78,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           ws={ctx.ws}
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}
+          onPreviewFile={ctx.onPreviewFile}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
         />
@@ -185,6 +187,7 @@ registerPanelType('repopage', {
       <RepoPage
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
+        sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
         projectDir={projectDir}
         onBack={() => {}}
         onCiEvent={ctx.onCiEvent ?? (() => {})}
@@ -265,6 +268,15 @@ registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
       serverId={ctx.serverId}
       ws={ctx.ws}
       onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
+      activeProjectDir={ctx.activeProjectDir ?? null}
+      memoryProjectCandidates={(ctx.sessions ?? [])
+        .filter((session) => Boolean(session.projectDir))
+        .map((session) => ({
+          projectDir: session.projectDir,
+          displayName: session.label || session.project || session.name,
+          sessionName: session.name,
+          source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,
+        }))}
     />
   ),
 });

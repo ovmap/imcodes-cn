@@ -1,5 +1,12 @@
+import { execFile } from 'node:child_process';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { describe, it, expect } from 'vitest';
-import { parseRemoteUrl, parseRemotes, compareSemver, extractVersion } from '../../src/repo/detector.js';
+import { detectRepo, parseRemoteUrl, parseRemotes, compareSemver, extractVersion } from '../../src/repo/detector.js';
+
+const execFileAsync = promisify(execFile);
 
 describe('parseRemoteUrl', () => {
   it('parses HTTPS github URL', () => {
@@ -27,9 +34,19 @@ describe('parseRemoteUrl', () => {
     expect(result).toEqual({ host: 'github.com', owner: 'acme', repo: 'repo' });
   });
 
+  it('parses ssh:// URLs with explicit SSH transport ports without using the port as canonical host', () => {
+    const result = parseRemoteUrl('ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git');
+    expect(result).toEqual({ host: '172.16.253.211', owner: 'Hermit', repo: 'ai_purchase2' });
+  });
+
   it('parses self-hosted URL', () => {
     const result = parseRemoteUrl('https://git.corp.example.com/team/internal-tool.git');
     expect(result).toEqual({ host: 'git.corp.example.com', owner: 'team', repo: 'internal-tool' });
+  });
+
+  it('preserves explicit HTTP(S) service ports for self-hosted remotes', () => {
+    const result = parseRemoteUrl('https://git.corp.example.com:8443/team/internal-tool.git');
+    expect(result).toEqual({ host: 'git.corp.example.com:8443', owner: 'team', repo: 'internal-tool' });
   });
 
   it('parses SSH alias format (e.g. github-work)', () => {
@@ -125,5 +142,41 @@ describe('extractVersion', () => {
   it('returns null when no version present', () => {
     expect(extractVersion('no version info here')).toBeNull();
     expect(extractVersion('')).toBeNull();
+  });
+});
+
+describe('detectRepo local branch context', () => {
+  it('includes local currentBranch when provider CLI is missing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-detect-'));
+    const repoDir = join(root, 'repo');
+    const binDir = join(root, 'bin');
+    const oldPath = process.env.PATH;
+    try {
+      await mkdir(repoDir, { recursive: true });
+      await mkdir(binDir, { recursive: true });
+      const { stdout: gitPathRaw } = await execFileAsync('which', ['git']);
+      const gitPath = gitPathRaw.trim();
+      await symlink(gitPath, join(binDir, 'git'));
+
+      await execFileAsync(gitPath, ['init'], { cwd: repoDir });
+      await execFileAsync(gitPath, ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+      await execFileAsync(gitPath, ['config', 'user.name', 'Test User'], { cwd: repoDir });
+      await execFileAsync(gitPath, ['checkout', '-b', 'feature/local'], { cwd: repoDir });
+      await writeFile(join(repoDir, 'file.txt'), 'hello\n');
+      await execFileAsync(gitPath, ['add', 'file.txt'], { cwd: repoDir });
+      await execFileAsync(gitPath, ['commit', '-m', 'initial'], { cwd: repoDir });
+      await execFileAsync(gitPath, ['remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { cwd: repoDir });
+
+      process.env.PATH = binDir;
+      const result = await detectRepo(repoDir);
+
+      expect(result.status).toBe('cli_missing');
+      expect(result.info?.currentBranch).toBe('feature/local');
+      expect(result.info?.owner).toBe('acme');
+      expect(result.info?.repo).toBe('widgets');
+    } finally {
+      process.env.PATH = oldPath;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

@@ -48,6 +48,7 @@ vi.mock('../src/hooks/usePref.js', () => ({
 }));
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 
 afterEach(() => {
   cleanup();
@@ -56,6 +57,68 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
+  it('keeps the robot status row visible without hosting the repo branch summary', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 1000,
+          cacheTokens: 2000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+      />,
+    );
+
+    const footer = container.querySelector('.session-usage-footer') as HTMLDivElement;
+    const ctxBar = container.querySelector('.session-ctx-bar');
+    const statsRow = container.querySelector('.session-usage-stats');
+    const liveStatus = container.querySelector('.session-live-status-inline.running');
+    const children = Array.from(footer.children);
+
+    expect(liveStatus?.textContent).toContain('🤖');
+    expect(liveStatus?.textContent).toContain('⚙️');
+    expect(liveStatus?.textContent).toContain('Agent working...');
+    expect(container.querySelector('.session-repo-branch-summary')).toBeNull();
+    expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+  });
+
+  it('keeps the robot status visible for idle or unknown agent states', () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    let status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expect(status?.textContent).toContain('🤖');
+    expect(status?.textContent).toContain('💤');
+    expect(status?.getAttribute('aria-label')).toContain('Agent idle');
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+        sessionState="stopped"
+      />,
+    );
+
+    status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expect(status?.textContent).toContain('🤖');
+    expect(status?.textContent).toContain('💤');
+    expect(status?.getAttribute('aria-label')).toContain('Agent idle');
+  });
+
   it('defaults the tools/thinking toggle on while undecided and first click turns it off', () => {
     toolPref.value = null;
 
@@ -287,6 +350,77 @@ describe('UsageFooter', () => {
     expect(screen.queryByText('stale quota text')).toBeNull();
     expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
+  });
+
+  it('uses provider-sourced context window before model-family inference', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER,
+          model: 'gpt-5.4-mini',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
+  });
+
+  it('honors Codex provider effective GPT-5.5 context window', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER,
+          model: 'gpt-5.5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
+  });
+
+  it('honors provider-reported 1M GPT-5.5 context window', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER,
+          model: 'gpt-5.5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 1M (10%)');
+  });
+
+  it('keeps the ctx meter visible at zero usage when the model is known', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+        agentType="codex-sdk"
+        modelOverride="gpt-5.5"
+      />,
+    );
+
+    expect(container.querySelector('.session-ctx-bar')).toBeTruthy();
+    expect(screen.getByText('gpt-5.5')).toBeDefined();
+    expect(screen.getByText('0 / 922k (0.0%)')).toBeDefined();
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 0 / 922k (0.0%)');
   });
 
   // ── Shell / script sessions are not "agents" ────────────────────────────────

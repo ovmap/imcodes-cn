@@ -1,10 +1,35 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+} from '../../shared/session-control-commands.js';
+import { MEMORY_WS } from '../../shared/memory-ws.js';
+import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
+import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
+import { MEMORY_FEATURE_CONFIG_MSG, MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import {
+  PREFERENCE_CONTEXT_START,
+  PREFERENCE_FEATURE_ENV_KEY,
+  PREFERENCE_IDEMPOTENCY_PREFIX,
+  PREFERENCE_INGEST_OBSERVATION_CLASS,
+  PREFERENCE_INGEST_OBSERVATION_STATE,
+  PREFERENCE_INGEST_ORIGIN,
+  PREFERENCE_INGEST_SCOPE,
+} from '../../shared/preference-ingest.js';
+import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-feature-config-store.js';
 
 const {
   getSessionMock,
@@ -25,7 +50,21 @@ const {
   removeQueuedTaskIntentMock,
   getQwenRuntimeConfigMock,
   searchLocalMemoryMock,
+  searchLocalMemoryAuthorizedMock,
   searchLocalMemorySemanticMock,
+  getProcessedProjectionStatsMock,
+  queryPendingContextEventsMock,
+  queryProcessedProjectionsMock,
+  recordMemoryHitsMock,
+  listContextObservationsMock,
+  deleteContextObservationMock,
+  ensureContextNamespaceMock,
+  promoteContextObservationMock,
+  writeContextObservationMock,
+  historyWorkerDispatchMock,
+  shouldUseHistoryWorkerMock,
+  getProviderMock,
+  ensureProviderConnectedMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -45,7 +84,37 @@ const {
   removeQueuedTaskIntentMock: vi.fn(),
   getQwenRuntimeConfigMock: vi.fn().mockResolvedValue({}),
   searchLocalMemoryMock: vi.fn(),
+  searchLocalMemoryAuthorizedMock: vi.fn(),
   searchLocalMemorySemanticMock: vi.fn(),
+  getProcessedProjectionStatsMock: vi.fn(() => ({
+    totalRecords: 0,
+    matchedRecords: 0,
+    recentSummaryCount: 0,
+    durableCandidateCount: 0,
+    projectCount: 0,
+    stagedEventCount: 0,
+    dirtyTargetCount: 0,
+    pendingJobCount: 0,
+  })),
+  queryPendingContextEventsMock: vi.fn(() => []),
+  queryProcessedProjectionsMock: vi.fn(() => []),
+  recordMemoryHitsMock: vi.fn(),
+  listContextObservationsMock: vi.fn(() => []),
+  deleteContextObservationMock: vi.fn(() => true),
+  ensureContextNamespaceMock: vi.fn(() => ({
+    id: 'pref-namespace',
+    key: 'pref-key',
+    localTenant: 'daemon-local',
+    visibility: 'private',
+    createdAt: 1,
+    updatedAt: 1,
+  })),
+  promoteContextObservationMock: vi.fn(() => ({ id: 'audit-1', observationId: 'obs-1', action: 'web_ui_promote' })),
+  writeContextObservationMock: vi.fn(),
+  historyWorkerDispatchMock: vi.fn(),
+  shouldUseHistoryWorkerMock: vi.fn(() => false),
+  getProviderMock: vi.fn(),
+  ensureProviderConnectedMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -106,7 +175,21 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: {
     append: vi.fn(),
     read: vi.fn(() => []),
+    readByTypesPreferred: vi.fn(() => []),
     clear: vi.fn(),
+  },
+}));
+
+vi.mock('../../src/daemon/timeline-history-pool.js', () => ({
+  getDefaultTimelineHistoryWorkerPool: vi.fn(() => ({ dispatch: historyWorkerDispatchMock })),
+  shouldUseTimelineHistoryWorkerPool: shouldUseHistoryWorkerMock,
+  TimelineHistoryPoolError: class TimelineHistoryPoolError extends Error {
+    readonly reason: string;
+
+    constructor(reason: string) {
+      super(reason);
+      this.reason = reason;
+    }
   },
 }));
 
@@ -135,6 +218,8 @@ vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   handleFileUpload: vi.fn(),
   handleFileDownload: vi.fn(),
   createProjectFileHandle: vi.fn(),
+  createProjectFileHandleFromValidatedPath: vi.fn(),
+  tryCreateProjectFileHandle: vi.fn(),
   lookupAttachment: vi.fn(() => undefined),
 }));
 
@@ -150,9 +235,27 @@ vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
   getQwenRuntimeConfig: getQwenRuntimeConfigMock,
 }));
 
+vi.mock('../../src/agent/provider-registry.js', () => ({
+  getProvider: getProviderMock,
+  ensureProviderConnected: ensureProviderConnectedMock,
+}));
+
 vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemory: searchLocalMemoryMock,
+  searchLocalMemoryAuthorized: searchLocalMemoryAuthorizedMock,
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
+}));
+
+vi.mock('../../src/store/context-store.js', () => ({
+  deleteContextObservation: deleteContextObservationMock,
+  getProcessedProjectionStats: getProcessedProjectionStatsMock,
+  queryPendingContextEvents: queryPendingContextEventsMock,
+  queryProcessedProjections: queryProcessedProjectionsMock,
+  recordMemoryHits: recordMemoryHitsMock,
+  listContextObservations: listContextObservationsMock,
+  ensureContextNamespace: ensureContextNamespaceMock,
+  promoteContextObservation: promoteContextObservationMock,
+  writeContextObservation: writeContextObservationMock,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -188,10 +291,57 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
   },
 }));
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import {
+  handleWebCommand,
+  __invalidateTransportListModelsCacheForTests,
+  __resetTransportListModelsCacheForTests,
+  __resolveTransportListModelsCacheTtlMsForTests,
+} from '../../src/daemon/command-handler.js';
+import { getDefaultTimelineDetailStore } from '../../src/daemon/timeline-detail-store.js';
+import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { timelineStore } from '../../src/daemon/timeline-store.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function timelineEvent(overrides: Record<string, unknown> = {}) {
+  return {
+    eventId: 'evt',
+    sessionId: 'deck_transport_brain',
+    ts: 1,
+    seq: 1,
+    epoch: 0,
+    source: 'daemon',
+    confidence: 'high',
+    type: 'tool.result',
+    payload: {},
+    ...overrides,
+  };
+}
+
+function enableMemoryFoundationFlags(): void {
+  vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), '1');
+  vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore), '1');
+}
+
+function enablePreferenceFeature(): void {
+  enableMemoryFoundationFlags();
+  vi.stubEnv(PREFERENCE_FEATURE_ENV_KEY, '1');
+}
+
+function enableMdIngestFeature(): void {
+  enableMemoryFoundationFlags();
+  vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest), '1');
+}
+
+function localMemoryManagementContext() {
+  return {
+    actorId: 'operator-1',
+    userId: 'operator-1',
+    role: 'user',
+    source: 'local_daemon',
+  };
+}
 
 function makeRuntimeProvider(sendImpl: ReturnType<typeof vi.fn>): TransportProvider {
   let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
@@ -259,6 +409,7 @@ function firstInvocationOrder(matcher: (call: unknown[]) => boolean): number {
 }
 
 describe('handleWebCommand transport queue behavior', () => {
+  let memoryFeatureConfigTempDir: string | null = null;
   const serverLink = {
     send: vi.fn(),
     sendBinary: vi.fn(),
@@ -268,9 +419,23 @@ describe('handleWebCommand transport queue behavior', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    serverLink.send.mockReset();
+    serverLink.sendBinary.mockReset();
+    serverLink.sendTimelineEvent.mockReset();
+    memoryFeatureConfigTempDir = mkdtempSync(join(tmpdir(), 'imcodes-memory-feature-flags-'));
+    vi.stubEnv('IMCODES_MEMORY_FEATURE_CONFIG_PATH', join(memoryFeatureConfigTempDir, 'feature-flags.json'));
+    resetMemoryFeatureConfigStoreForTests();
     supervisionDecideMock.mockResolvedValue({ decision: 'complete', reason: 'ok', confidence: 0.9 });
     getQwenRuntimeConfigMock.mockResolvedValue({});
+    historyWorkerDispatchMock.mockReset();
+    shouldUseHistoryWorkerMock.mockReset();
+    shouldUseHistoryWorkerMock.mockReturnValue(false);
+    getProviderMock.mockReset();
+    ensureProviderConnectedMock.mockReset();
+    __resetTransportListModelsCacheForTests();
+    getDefaultTimelineDetailStore().clear();
     searchLocalMemoryMock.mockResolvedValue(emptyMemorySearchResult());
+    searchLocalMemoryAuthorizedMock.mockReturnValue(emptyMemorySearchResult());
     searchLocalMemorySemanticMock.mockResolvedValue(emptyMemorySearchResult());
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -283,7 +448,128 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   afterEach(() => {
+    resetMemoryFeatureConfigStoreForTests();
     vi.unstubAllEnvs();
+    if (memoryFeatureConfigTempDir) {
+      rmSync(memoryFeatureConfigTempDir, { recursive: true, force: true });
+      memoryFeatureConfigTempDir = null;
+    }
+  });
+
+  // ── F4 regression suite (audit f395d49c-78c) ─────────────────────────────
+  //
+  // Before this fix, `handleSend` read `record = getSession(sessionName)` and
+  // computed `isTransportSession` via `record?.runtimeType === 'transport' ||
+  // (typeof record?.agentType === 'string' && isTransportAgent(...))`. When
+  // record was undefined, both clauses evaluated to false, the
+  // `!transportRuntime && isTransportSession` guard at line 2929 was skipped,
+  // and the message silently fell through to the process-agent / tmux path
+  // around line 3380+. `sendProcessSessionMessage` then ran with
+  // `agentType='unknown'` and tried to `sendKeys` to a tmux session that did
+  // not exist; the failure was only logged, never surfaced. The client saw
+  // an "accepted" command.ack while the message reached no backend.
+  //
+  // For `transportRuntime && !providerSessionId && !record` it was worse:
+  // `enqueueResend` + `emitAcceptedReceiptAck` ran, but `if (record)` guarded
+  // the relaunch dispatch, so the message was accepted into a queue with no
+  // scheduled recovery.
+  //
+  // T3/T4 lock the fail-closed contract: any record-missing session.send
+  // emits an explicit error ack, does NOT enqueue, does NOT invoke any
+  // process-agent / tmux path, and does NOT trigger a relaunch.
+
+  it('T3: handleSend with record=undefined (no runtime) emits session_missing error and does NOT fallthrough to process-agent / enqueue / launch', async () => {
+    // Override default beforeEach record return — simulate a session that
+    // was concurrently deleted (e.g. clone teardown race) or whose store
+    // entry was lost.
+    //
+    // Protocol note: the early `emitAcceptedReceiptAck()` at command-handler
+    // line ~2530 is a daemon-receipt ack ("daemon got your command", per
+    // CLAUDE.md transport command liveness contract) and runs BEFORE the
+    // F4 guard. The fail-closed error ack from F4 then signals "but
+    // delivery failed". This dual-ack pattern is intentional and
+    // documented; the web client treats the later error ack as the
+    // authoritative outcome.
+    getSessionMock.mockReturnValue(undefined);
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand(
+      { type: 'session.send', session: 'deck_missing_brain', text: 'hello', commandId: 'cmd-missing-1' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    // The F4 outcome ack carries error=session_missing.
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'command.ack',
+        commandId: 'cmd-missing-1',
+        session: 'deck_missing_brain',
+        status: 'error',
+        error: 'session_missing',
+      }),
+    );
+
+    // session.state error was broadcast (UI surfaces the failure).
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_missing_brain',
+      'session.state',
+      expect.objectContaining({ state: 'error', error: 'session_missing' }),
+      expect.any(Object),
+    );
+
+    // No user.message was emitted (message never reached any backend).
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_missing_brain',
+      'user.message',
+      expect.anything(),
+      expect.anything(),
+    );
+
+    // No transport relaunch / launch attempt — F4 prevents accepted-without-dispatch.
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('T4: handleSend with record=undefined AND runtime+null providerSessionId still emits session_missing error (no accepted-without-relaunch)', async () => {
+    // This is the second F4 path: a stale runtime entry without a provider
+    // session id can occur after a partial relaunch. Pre-fix behaviour:
+    // `enqueueResend` + `emitAcceptedReceiptAck` ran, but `if (record)`
+    // skipped relaunch — message landed in resend queue with no scheduled
+    // recovery.
+    const runtimeSendMock = vi.fn();
+    getSessionMock.mockReturnValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: null,
+      send: runtimeSendMock,
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+    });
+
+    handleWebCommand(
+      { type: 'session.send', session: 'deck_missing_brain', text: 'hello again', commandId: 'cmd-missing-2' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'command.ack',
+        commandId: 'cmd-missing-2',
+        status: 'error',
+        error: 'session_missing',
+      }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_missing_brain',
+      'session.state',
+      expect.objectContaining({ state: 'error', error: 'session_missing' }),
+      expect.any(Object),
+    );
+    // Critically: no relaunch attempted (the bug previously skipped this).
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+    // Critically: runtime.send never reached.
+    expect(runtimeSendMock).not.toHaveBeenCalled();
   });
 
   it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
@@ -535,7 +821,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-codex', status: 'accepted' });
   });
 
-  it('dispatches /stop immediately for transport sessions without emitting queued state', async () => {
+  it('dispatches direct session.cancel immediately for transport sessions without emitting /stop text', async () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -545,17 +831,54 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingMessages: ['a', 'b', 'c'],
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop' }, serverLink as any);
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop',
+    }, serverLink as any);
     await flushAsync();
 
     expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
-      'user.message',
-      { text: '/stop', allowDuplicate: true, commandId: 'cmd-stop' },
-      undefined,
+      'session.state',
+      {
+        state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+      },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      {
+        state: 'idle',
+        pendingCount: 0,
+        pendingMessages: [],
+        pendingMessageEntries: [],
+      },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    const stopFeedbackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === SESSION_CONTROL_TIMELINE_STATE_STOPPING
+      && (call[2] as Record<string, unknown>)?.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+    );
+    const idleOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle',
+    );
+    expect(stopFeedbackOrder).toBeLessThan(idleOrder);
+    expect(stopFeedbackOrder).toBeLessThan(cancel.mock.invocationCallOrder[0]);
+    const stopUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as Record<string, unknown>)?.text === '/stop',
+    );
+    expect(stopUserMessages).toEqual([]);
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -564,7 +887,71 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
-  it('keeps /stop on the priority lane while a transport model switch holds the send lock', async () => {
+  it('keeps legacy /stop sends as direct cancel compatibility without emitting /stop text', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop-legacy' }, serverLink as any);
+    await flushAsync();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-stop-legacy',
+      status: 'accepted',
+    });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      {
+        state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+      },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    const stopUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as Record<string, unknown>)?.text === '/stop',
+    );
+    expect(stopUserMessages).toEqual([]);
+  });
+
+  it('acks /stop before provider cancellation settles', async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => {}));
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['blocked send'],
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop-cancel-hang',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-stop-cancel-hang',
+      status: 'accepted',
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    const ackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'command.ack'
+      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-stop-cancel-hang',
+    );
+    expect(ackOrder).toBeLessThan(cancel.mock.invocationCallOrder[0]);
+  });
+
+  it('keeps direct session.cancel on the priority lane while a transport model switch holds the send lock', async () => {
     let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
     getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
       resolveRuntimeConfig = resolve;
@@ -598,9 +985,8 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     handleWebCommand({
-      type: 'session.send',
-      session: 'deck_transport_brain',
-      text: '/stop',
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
       commandId: 'cmd-stop-priority',
     }, serverLink as any);
 
@@ -670,6 +1056,182 @@ describe('handleWebCommand transport queue behavior', () => {
       && (call[2] as Record<string, unknown>)?.commandId === 'cmd-receipt-first',
     );
     expect(ackOrder).toBeLessThan(transportSend.mock.invocationCallOrder[0]);
+  });
+
+  it('strips trusted leading @pref lines from user text but sends rendered preference context without waiting for persistence', async () => {
+    enablePreferenceFeature();
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '@pref: Use pnpm\n\nPlease run tests',
+      commandId: 'cmd-pref-trusted',
+      origin: 'user_keyboard',
+      userId: 'user-1',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-pref-trusted',
+      status: 'accepted',
+    });
+    expect(transportSend).not.toHaveBeenCalled();
+    expect(writeContextObservationMock).not.toHaveBeenCalled();
+
+    await flushAsync();
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith(
+      'Please run tests',
+      'cmd-pref-trusted',
+      undefined,
+      expect.stringContaining('Use pnpm'),
+    );
+    expect(transportSend.mock.calls[0]?.[3]).toContain(PREFERENCE_CONTEXT_START);
+    expect(transportSend.mock.calls[0]?.[3]).not.toContain('@pref:');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: 'Please run tests', allowDuplicate: true, commandId: 'cmd-pref-trusted', clientMessageId: 'cmd-pref-trusted' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-pref-trusted' }),
+    );
+    expect(ensureContextNamespaceMock).toHaveBeenCalledWith({
+      scope: PREFERENCE_INGEST_SCOPE,
+      userId: 'user-1',
+      name: 'preferences',
+    });
+    expect(writeContextObservationMock).toHaveBeenCalledWith(expect.objectContaining({
+      namespaceId: 'pref-namespace',
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      origin: PREFERENCE_INGEST_ORIGIN,
+      content: expect.objectContaining({ text: 'Use pnpm' }),
+      sourceEventIds: ['cmd-pref-trusted'],
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
+    }));
+    const ackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'command.ack'
+      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-pref-trusted',
+    );
+    expect(ackOrder).toBeLessThan(transportSend.mock.invocationCallOrder[0]);
+    expect(ackOrder).toBeLessThan(listContextObservationsMock.mock.invocationCallOrder[0]);
+    expect(ackOrder).toBeLessThan(writeContextObservationMock.mock.invocationCallOrder[0]);
+  });
+
+  it('renders persisted preferences into future provider sends while leaving timeline text unchanged', async () => {
+    enablePreferenceFeature();
+    listContextObservationsMock.mockReturnValueOnce([
+      {
+        id: 'pref-observation',
+        namespaceId: 'pref-namespace',
+        scope: PREFERENCE_INGEST_SCOPE,
+        class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+        origin: PREFERENCE_INGEST_ORIGIN,
+        fingerprint: 'pref-fingerprint',
+        content: {
+          text: 'Use pnpm',
+          idempotencyKey: `${PREFERENCE_IDEMPOTENCY_PREFIX}\u0000user-1\u0000${PREFERENCE_INGEST_SCOPE}:user-1\u0000old-message\u0000pref-fingerprint`,
+        },
+        textHash: 'hash',
+        sourceEventIds: ['old-message'],
+        state: PREFERENCE_INGEST_OBSERVATION_STATE,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    ]);
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'Please run tests',
+      commandId: 'cmd-pref-future',
+      origin: 'user_keyboard',
+      userId: 'user-1',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith(
+      'Please run tests',
+      'cmd-pref-future',
+      undefined,
+      expect.stringContaining('Use pnpm'),
+    );
+    expect(writeContextObservationMock).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: 'Please run tests', allowDuplicate: true, commandId: 'cmd-pref-future', clientMessageId: 'cmd-pref-future' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-pref-future' }),
+    );
+  });
+
+  it('fails closed for missing or untrusted @pref origins without stripping provider text', async () => {
+    enablePreferenceFeature();
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '@pref: Do not trust missing origin\nRun it',
+      commandId: 'cmd-pref-missing-origin',
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '@pref: Agent-authored syntax\nRun it',
+      commandId: 'cmd-pref-agent-origin',
+      origin: 'agent_output',
+      userId: 'user-1',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('@pref: Do not trust missing origin\nRun it', 'cmd-pref-missing-origin');
+    expect(transportSend).toHaveBeenCalledWith('@pref: Agent-authored syntax\nRun it', 'cmd-pref-agent-origin');
+    expect(ensureContextNamespaceMock).not.toHaveBeenCalled();
+    expect(writeContextObservationMock).not.toHaveBeenCalled();
+  });
+
+  it('passes trusted @pref text through unchanged when preferences are disabled', async () => {
+    vi.stubEnv(PREFERENCE_FEATURE_ENV_KEY, '0');
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '@pref: Use tabs\nKeep coding',
+      commandId: 'cmd-pref-disabled',
+      origin: 'user_keyboard',
+      userId: 'user-1',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('@pref: Use tabs\nKeep coding', 'cmd-pref-disabled');
+    expect(ensureContextNamespaceMock).not.toHaveBeenCalled();
+    expect(writeContextObservationMock).not.toHaveBeenCalled();
   });
 
   it('acks ordinary transport sends before waiting on a prior control command lock', async () => {
@@ -806,7 +1368,20 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
   });
 
-  it('forwards /compact unchanged to the transport SDK without daemon-side compaction events', async () => {
+  it('acks ordinary transport sends while a timeline history worker request is still active', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    let resolveHistory!: (value: {
+      events: unknown[];
+      eventsRead: number;
+      payloadBytes: number;
+      droppedEvents: number;
+      truncatedEvents: number;
+      readMs: number;
+      sanitizeMs: number;
+    }) => void;
+    historyWorkerDispatchMock.mockReturnValue(new Promise((resolve) => {
+      resolveHistory = resolve;
+    }));
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -814,22 +1389,768 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingCount: 0,
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/compact', commandId: 'cmd-compact' }, serverLink as any);
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'hist-worker-still-running',
+      limit: 50,
+    }, serverLink as any);
     await flushAsync();
 
-    expect(transportSend).toHaveBeenCalledWith('/compact', 'cmd-compact');
-    expect(emitMock).toHaveBeenCalledWith(
-      'deck_transport_brain',
-      'user.message',
-      { text: '/compact', allowDuplicate: true, commandId: 'cmd-compact', clientMessageId: 'cmd-compact' },
-      expect.objectContaining({ eventId: 'transport-user:cmd-compact' }),
+    expect(historyWorkerDispatchMock).toHaveBeenCalled();
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'do not wait for timeline hydration',
+      commandId: 'cmd-while-history-worker-active',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-while-history-worker-active',
+      status: 'accepted',
+    });
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-while-history-worker-active',
+      status: 'accepted',
+      session: 'deck_transport_brain',
+    });
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-worker-still-running',
+    }));
+
+    await flushAsync();
+    expect(transportSend).toHaveBeenCalledWith('do not wait for timeline hydration', 'cmd-while-history-worker-active');
+
+    const ackSendOrder = serverLink.send.mock.invocationCallOrder.find((_, index) => {
+      const msg = serverLink.send.mock.calls[index]?.[0] as Record<string, unknown> | undefined;
+      return msg?.type === 'command.ack' && msg.commandId === 'cmd-while-history-worker-active';
+    }) ?? Number.POSITIVE_INFINITY;
+
+    resolveHistory({
+      events: [],
+      eventsRead: 0,
+      payloadBytes: 2,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 250,
+      sanitizeMs: 0,
+    });
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-worker-still-running',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
+    }));
+    const historySendOrder = serverLink.send.mock.invocationCallOrder.find((_, index) => {
+      const msg = serverLink.send.mock.calls[index]?.[0] as Record<string, unknown> | undefined;
+      return msg?.type === TIMELINE_MESSAGES.HISTORY && msg.requestId === 'hist-worker-still-running';
+    }) ?? Number.POSITIVE_INFINITY;
+    expect(ackSendOrder).toBeLessThan(historySendOrder);
+  });
+
+  it('coalesces equivalent in-flight timeline history requests while preserving request ids', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    let resolveHistory!: (value: {
+      events: unknown[];
+      eventsRead: number;
+      payloadBytes: number;
+      droppedEvents: number;
+      truncatedEvents: number;
+      readMs: number;
+      sanitizeMs: number;
+    }) => void;
+    historyWorkerDispatchMock.mockReturnValue(new Promise((resolve) => {
+      resolveHistory = resolve;
+    }));
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'hist-coalesce-1',
+      limit: 50,
+    }, serverLink as any);
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'hist-coalesce-2',
+      limit: 50,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledTimes(1);
+    resolveHistory({
+      events: [],
+      eventsRead: 0,
+      payloadBytes: 2,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 50,
+      sanitizeMs: 0,
+    });
+    await flushAsync();
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-coalesce-1',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-coalesce-2',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+    }));
+  });
+
+  it('shapes multi-MB timeline.replay payloads under the default envelope budget without legacy gap truncation', async () => {
+    vi.mocked(timelineEmitter.replay).mockReturnValueOnce({
+      truncated: false,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      events: Array.from({ length: 80 }, (_, index) => timelineEvent({
+        eventId: `replay-tool-${index}`,
+        ts: index,
+        seq: index,
+        payload: {
+          tool: 'shell',
+          output: `${index}: ${'x'.repeat(128 * 1024)}`,
+          detail: { raw: { stdout: 'x'.repeat(1024 * 1024) } },
+        },
+      })),
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-big',
+      afterSeq: 0,
+      epoch: 0,
+    }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((msg) => msg.requestId === 'replay-big');
+    expect(response).toMatchObject({
+      type: TIMELINE_MESSAGES.REPLAY,
+      status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      truncated: false,
+      payloadTruncated: true,
+    });
+    expect(response?.payloadBytes).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+    expect(Buffer.byteLength(JSON.stringify(response?.events), 'utf8')).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+  });
+
+  it('shapes epoch-mismatch replay fallback from JSONL tail under the default envelope budget', async () => {
+    vi.mocked(timelineStore.read).mockReturnValueOnce(Array.from({ length: 100 }, (_, index) => timelineEvent({
+      eventId: `jsonl-tail-${index}`,
+      ts: index,
+      seq: index,
+      payload: { output: 'j'.repeat(96 * 1024), detail: { output: 'j'.repeat(96 * 1024) } },
+    })) as never);
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-epoch-reset',
+      afterSeq: 10,
+      epoch: -1,
+    }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((msg) => msg.requestId === 'replay-epoch-reset');
+    expect(response).toMatchObject({
+      type: TIMELINE_MESSAGES.REPLAY,
+      status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+      source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL,
+      cursorReset: true,
+      payloadTruncated: true,
+    });
+    expect(response?.payloadBytes).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+    expect(Buffer.byteLength(JSON.stringify(response?.events), 'utf8')).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+  });
+
+  it('coalesces equivalent in-flight timeline.replay requests while preserving request ids', async () => {
+    vi.mocked(timelineEmitter.replay).mockReturnValueOnce({
+      truncated: false,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      events: [timelineEvent({
+        eventId: 'replay-coalesced-event',
+        payload: { text: 'shared replay' },
+      })],
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-coalesce-1',
+      afterSeq: 41,
+      epoch: 0,
+    }, serverLink as any);
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-coalesce-2',
+      afterSeq: 41,
+      epoch: 0,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(timelineEmitter.replay).toHaveBeenCalledTimes(1);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      requestId: 'replay-coalesce-1',
+      events: [expect.objectContaining({ eventId: 'replay-coalesced-event' })],
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      requestId: 'replay-coalesce-2',
+      events: [expect.objectContaining({ eventId: 'replay-coalesced-event' })],
+    }));
+  });
+
+  it('returns a terminal malformed error for invalid timeline.replay requests', async () => {
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-malformed',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-malformed',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST,
+      events: [],
+      payloadBytes: 2,
+      payloadTruncated: false,
+    }));
+    expect(timelineEmitter.replay).not.toHaveBeenCalled();
+  });
+
+  it('acks ordinary transport sends while a data-plane serverLink.send promise is unsettled', async () => {
+    let resolveDataPlane!: () => void;
+    serverLink.send.mockImplementation((msg: { type?: string }) => {
+      if (msg.type === TIMELINE_MESSAGES.DETAIL) {
+        return new Promise<void>((resolve) => {
+          resolveDataPlane = resolve;
+        });
+      }
+      return undefined;
+    });
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-data-plane-pending',
+      detailId: 'detail-1',
+    }, serverLink as any);
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.DETAIL,
+      requestId: 'detail-data-plane-pending',
+    }));
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'do not wait for data-plane send settlement',
+      commandId: 'cmd-while-detail-send-pending',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-while-detail-send-pending',
+      status: 'accepted',
+    });
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-while-detail-send-pending',
+      status: 'accepted',
+      session: 'deck_transport_brain',
+    });
+
+    await flushAsync();
+    expect(transportSend).toHaveBeenCalledWith('do not wait for data-plane send settlement', 'cmd-while-detail-send-pending');
+    resolveDataPlane();
+  });
+
+  it('acks ordinary transport sends within the hot path while synthetic data-plane jobs are active', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    historyWorkerDispatchMock.mockReturnValue(new Promise(() => {}));
+    vi.mocked(timelineEmitter.replay).mockReturnValueOnce({
+      truncated: false,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      events: Array.from({ length: 60 }, (_, index) => timelineEvent({
+        eventId: `synthetic-replay-${index}`,
+        ts: index,
+        seq: index,
+        payload: { output: 'x'.repeat(64 * 1024) },
+      })),
+    });
+    getProviderMock.mockReturnValue({
+      listModels: vi.fn(() => new Promise(() => {})),
+    });
+    const ref = getDefaultTimelineDetailStore().put({
+      sessionName: 'deck_transport_brain',
+      epoch: 0,
+      eventId: 'evt-load',
+      fieldPath: 'payload.output',
+      value: 'load detail',
+    });
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'load-history',
+      limit: 50,
+    }, serverLink as any);
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.PAGE_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'load-page',
+      limit: 50,
+      cursor: { epoch: 0, beforeTs: 10, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+    }, serverLink as any);
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'load-replay',
+      afterSeq: 1,
+      epoch: 0,
+    }, serverLink as any);
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'load-detail',
+      detailId: ref!.detailId,
+      eventId: 'evt-load',
+      fieldPath: 'payload.output',
+    }, serverLink as any);
+    handleWebCommand({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      providerId: 'local',
+      requestId: 'load-models',
+    }, serverLink as any);
+
+    const startedAt = performance.now();
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ack under synthetic load',
+      commandId: 'cmd-synthetic-load',
+    }, serverLink as any);
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(500);
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-synthetic-load',
+      status: 'accepted',
+      session: 'deck_transport_brain',
+    });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-synthetic-load',
+      status: 'accepted',
+    });
+    expect(transportSend).not.toHaveBeenCalled();
+
+    await flushAsync();
+    expect(transportSend).toHaveBeenCalledWith('ack under synthetic load', 'cmd-synthetic-load');
+  });
+
+  it('serves timeline.detail from the scoped detail store and rejects mismatched bindings', async () => {
+    const ref = getDefaultTimelineDetailStore().put({
+      sessionName: 'deck_transport_brain',
+      epoch: 0,
+      eventId: 'evt-detail',
+      fieldPath: 'payload.output',
+      value: 'full detail output',
+      previewBytes: 1024,
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-ok',
+      detailId: ref!.detailId,
+      epoch: 0,
+      eventId: 'evt-detail',
+      fieldPath: 'payload.output',
+    }, serverLink as any);
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.DETAIL,
+      requestId: 'detail-ok',
+      detailId: ref!.detailId,
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.CACHE,
+      payloadBytes: expect.any(Number),
+      payloadTruncated: false,
+      value: 'full detail output',
+    }));
+    const detailOk = serverLink.send.mock.calls.find((call) => (call[0] as Record<string, unknown>).requestId === 'detail-ok')?.[0];
+    expect(Buffer.byteLength(JSON.stringify(detailOk), 'utf8')).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL);
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-bad-field',
+      detailId: ref!.detailId,
+      epoch: 0,
+      eventId: 'evt-detail',
+      fieldPath: 'payload.error',
+    }, serverLink as any);
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.DETAIL,
+      requestId: 'detail-bad-field',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      // eventId/fieldPath mismatch returns MISSING rather than UNAUTHORIZED
+      // to avoid leaking detailId existence (CC1 #11 / tasks.md 2.5 / spec D6)
+      errorReason: TIMELINE_DETAIL_ERROR_REASONS.MISSING,
+    }));
+  });
+
+  it('returns stable terminal errors for malformed, missing, oversized, cross-session, and internal timeline.detail requests', async () => {
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-malformed',
+    }, serverLink as any);
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-missing',
+      detailId: 'td_missing',
+      epoch: 0,
+    }, serverLink as any);
+
+    const oversized = getDefaultTimelineDetailStore().put({
+      sessionName: 'deck_transport_brain',
+      epoch: 0,
+      eventId: 'evt-big',
+      fieldPath: 'payload.output',
+      value: 'x'.repeat(2 * 1024 * 1024),
+    });
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-oversized',
+      detailId: oversized!.detailId,
+      epoch: 0,
+    }, serverLink as any);
+
+    const scoped = getDefaultTimelineDetailStore().put({
+      sessionName: 'deck_transport_brain',
+      epoch: 0,
+      eventId: 'evt-scoped',
+      fieldPath: 'payload.output',
+      value: 'private detail',
+    });
+    getSessionMock.mockImplementation((name: string) => ({
+      name,
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    }));
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_other_brain',
+      requestId: 'detail-cross-session',
+      detailId: scoped!.detailId,
+      epoch: 0,
+    }, serverLink as any);
+
+    const store = getDefaultTimelineDetailStore();
+    vi.spyOn(store, 'get').mockImplementationOnce(() => {
+      throw new Error('detail store failed');
+    });
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'detail-internal',
+      detailId: scoped!.detailId,
+      epoch: 0,
+    }, serverLink as any);
+
+    const reasonByRequestId = new Map(
+      serverLink.send.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.DETAIL)
+        .map((msg) => [msg.requestId, msg.errorReason]),
     );
+    expect(reasonByRequestId.get('detail-malformed')).toBe(TIMELINE_DETAIL_ERROR_REASONS.MALFORMED);
+    expect(reasonByRequestId.get('detail-missing')).toBe(TIMELINE_DETAIL_ERROR_REASONS.MISSING);
+    expect(reasonByRequestId.get('detail-oversized')).toBe(TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED);
+    expect(reasonByRequestId.get('detail-cross-session')).toBe(TIMELINE_DETAIL_ERROR_REASONS.MISSING);
+    expect(reasonByRequestId.get('detail-internal')).toBe(TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR);
+  });
+
+  it('coalesces concurrent transport.list_models requests for the same agent/provider and preserves request ids', async () => {
+    let resolveModels!: (value: { models: Array<{ id: string }> }) => void;
+    const listModels = vi.fn(() => new Promise((resolve) => {
+      resolveModels = resolve;
+    }));
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', providerId: 'local', requestId: 'models-1' }, serverLink as any);
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', providerId: 'local', requestId: 'models-2' }, serverLink as any);
+    await flushAsync();
+
+    expect(listModels).toHaveBeenCalledTimes(1);
+    resolveModels({ models: [{ id: 'gpt-5-codex' }] });
+    await flushAsync();
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: 'models-1',
+      models: [{ id: 'gpt-5-codex' }],
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: 'models-2',
+      models: [{ id: 'gpt-5-codex' }],
+    }));
+  });
+
+  it('serves transport.list_models from TTL cache without probing the provider again', async () => {
+    const listModels = vi.fn().mockResolvedValue({ models: [{ id: 'cached-model' }], defaultModel: 'cached-model' });
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'gemini-sdk', requestId: 'ttl-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'gemini-sdk', requestId: 'ttl-2' }, serverLink as any);
+    await flushAsync();
+
+    expect(listModels).toHaveBeenCalledTimes(1);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'ttl-2',
+      models: [{ id: 'cached-model' }],
+      defaultModel: 'cached-model',
+    }));
+    expect(__resolveTransportListModelsCacheTtlMsForTests()).toBe(5_000);
+    vi.stubEnv('IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS', '120000');
+    expect(__resolveTransportListModelsCacheTtlMsForTests()).toBe(60_000);
+  });
+
+  it('invalidates transport.list_models TTL cache when session transport config changes', async () => {
+    const listModels = vi.fn()
+      .mockResolvedValueOnce({ models: [{ id: 'old-config-model' }] })
+      .mockResolvedValueOnce({ models: [{ id: 'new-config-model' }] });
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', providerId: 'local', requestId: 'config-cache-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.update_transport_config',
+      sessionName: 'deck_transport_brain',
+      transportConfig: { providerId: 'local', apiKeyRef: 'synthetic-next' },
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', providerId: 'local', requestId: 'config-cache-2' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    expect(listModels).toHaveBeenCalledTimes(2);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'config-cache-2',
+      models: [{ id: 'new-config-model' }],
+    }));
+  });
+
+  it('does not let stale transport.list_models inflight results repopulate cache after invalidation', async () => {
+    let resolveOld!: (value: { models: Array<{ id: string }> }) => void;
+    let resolveNew!: (value: { models: Array<{ id: string }> }) => void;
+    const listModels = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'gemini-sdk', providerId: 'local', requestId: 'stale-inflight-1' }, serverLink as any);
+    await flushAsync();
+    expect(listModels).toHaveBeenCalledTimes(1);
+
+    __invalidateTransportListModelsCacheForTests('synthetic_config_change');
+    resolveOld({ models: [{ id: 'stale-model' }] });
+    await flushAsync();
+    await flushAsync();
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'gemini-sdk', providerId: 'local', requestId: 'stale-inflight-2' }, serverLink as any);
+    await flushAsync();
+    expect(listModels).toHaveBeenCalledTimes(2);
+    resolveNew({ models: [{ id: 'fresh-model' }] });
+    await flushAsync();
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'stale-inflight-2',
+      models: [{ id: 'fresh-model' }],
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'stale-inflight-2',
+      models: [{ id: 'stale-model' }],
+    }));
+  });
+
+  it('refreshes transport.list_models after TTL expiry', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS', '5');
+    const listModels = vi.fn()
+      .mockResolvedValueOnce({ models: [{ id: 'old-model' }] })
+      .mockResolvedValueOnce({ models: [{ id: 'new-model' }] });
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'cursor-headless', requestId: 'expire-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+    await sleep(10);
+    handleWebCommand({ type: 'transport.list_models', agentType: 'cursor-headless', requestId: 'expire-2' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    expect(listModels).toHaveBeenCalledTimes(2);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'expire-2',
+      models: [{ id: 'new-model' }],
+    }));
+  });
+
+  it('does not cache failed transport.list_models work and allows retry', async () => {
+    const listModels = vi.fn()
+      .mockRejectedValueOnce(new Error('probe failed'))
+      .mockResolvedValueOnce({ models: [{ id: 'retry-model' }] });
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'copilot-sdk', requestId: 'fail-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+    handleWebCommand({ type: 'transport.list_models', agentType: 'copilot-sdk', requestId: 'retry-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    expect(listModels).toHaveBeenCalledTimes(2);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'fail-1',
+      models: [],
+      error: 'probe failed',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'retry-1',
+      models: [{ id: 'retry-model' }],
+    }));
+  });
+
+  it.each([...TRANSPORT_SESSION_AGENT_TYPES])('forwards /compact unchanged for %s without rendering it as a user message', async (agentType) => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType,
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    const commandId = `cmd-compact-${agentType}`;
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/compact', commandId }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId,
+      status: 'accepted',
+    });
+    expect(transportSend).not.toHaveBeenCalled();
+
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('/compact', commandId);
+    const compactUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as { text?: string } | undefined)?.text === '/compact',
+    );
+    expect(compactUserMessages).toEqual([]);
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'compaction.result',
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  it('shows a compact-specific visible error when transport runtime rejects /compact synchronously', async () => {
+    const transportSend = vi.fn(() => {
+      throw new Error('provider does not support compact');
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/compact',
+      commandId: 'cmd-compact-fail',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('/compact', 'cmd-compact-fail');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      { text: '⚠️ Compact failed: provider does not support compact', streaming: false, memoryExcluded: true },
+      { source: 'daemon', confidence: 'high' },
+    );
+    const compactUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as { text?: string } | undefined)?.text === '/compact',
+    );
+    expect(compactUserMessages).toEqual([]);
   });
 
   it('rejects a duplicate commandId without dispatching it to the transport runtime again', async () => {
@@ -1829,5 +3150,356 @@ describe('handleWebCommand transport queue behavior', () => {
       activeModel: 'claude-sonnet-4.6',
       modelDisplay: 'claude-sonnet-4.6',
     }));
+  });
+
+  it('reports effective daemon memory feature states including server runtime override and fallback config', async () => {
+    enablePreferenceFeature();
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), '0');
+
+    handleWebCommand({ type: MEMORY_WS.FEATURES_QUERY, requestId: 'features-1' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.FEATURES_RESPONSE,
+      requestId: 'features-1',
+      records: expect.arrayContaining([
+        expect.objectContaining({ flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences, enabled: true }),
+        expect.objectContaining({ flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, enabled: false }),
+      ]),
+    });
+  });
+
+  it('applies server-managed global memory feature config ahead of local daemon config', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences), '0');
+
+    handleWebCommand({
+      type: MEMORY_FEATURE_CONFIG_MSG.APPLY,
+      flags: {
+        [MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry]: true,
+        [MEMORY_FEATURE_FLAGS_BY_NAME.observationStore]: true,
+        [MEMORY_FEATURE_FLAGS_BY_NAME.preferences]: true,
+      },
+    }, serverLink as any);
+
+    handleWebCommand({ type: MEMORY_WS.FEATURES_QUERY, requestId: 'features-runtime-override' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_RESPONSE,
+      requestId: 'features-runtime-override',
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+          requested: true,
+          enabled: true,
+          source: 'runtime_config_override',
+        }),
+      ]),
+    }));
+  });
+
+  it('persists local fallback memory feature toggles when a direct daemon request is used', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), '0');
+
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-1',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-1',
+      success: true,
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      requested: true,
+      enabled: true,
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+          requested: true,
+          enabled: true,
+          source: 'persisted_config',
+        }),
+      ]),
+    }));
+
+    serverLink.send.mockClear();
+    handleWebCommand({ type: MEMORY_WS.FEATURES_QUERY, requestId: 'features-after-set' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_RESPONSE,
+      requestId: 'features-after-set',
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+          requested: true,
+          enabled: true,
+          source: 'persisted_config',
+        }),
+      ]),
+    }));
+  });
+
+  it('cascades dependencies when enabling a local fallback memory feature toggle', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-dep',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-dep',
+      success: true,
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      requested: true,
+      enabled: true,
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+          requested: true,
+          enabled: true,
+        }),
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.observationStore,
+          requested: true,
+          enabled: true,
+        }),
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+          requested: true,
+          enabled: true,
+          dependencyBlocked: [],
+        }),
+      ]),
+    }));
+  });
+
+  it('reports dependency-blocked requested features when a dependency is disabled later', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-pref-on',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+    serverLink.send.mockClear();
+
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-ns-off',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      enabled: false,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-ns-off',
+      success: true,
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+          requested: true,
+          enabled: false,
+          dependencyBlocked: expect.arrayContaining([
+            MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+            MEMORY_FEATURE_FLAGS_BY_NAME.observationStore,
+          ]),
+        }),
+      ]),
+    }));
+  });
+
+  it('rejects invalid local fallback memory feature toggle requests', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-invalid',
+      flag: 'mem.feature.not_real',
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-invalid',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+    });
+  });
+
+  it('rejects local fallback memory feature toggles without management context', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-no-context',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      enabled: true,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-no-context',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MANAGEMENT_REQUEST_UNROUTED,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.MANAGEMENT_REQUEST_UNROUTED,
+    });
+  });
+
+  it('exposes trusted preference records through shared memory management messages', async () => {
+    enablePreferenceFeature();
+    listContextObservationsMock.mockReturnValueOnce([
+      {
+        id: 'pref-1',
+        scope: PREFERENCE_INGEST_SCOPE,
+        class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+        origin: PREFERENCE_INGEST_ORIGIN,
+        fingerprint: 'fp-1',
+        content: {
+          text: 'Prefer pnpm',
+          idempotencyKey: [PREFERENCE_IDEMPOTENCY_PREFIX, 'user-1', `${PREFERENCE_INGEST_SCOPE}:user-1`, 'cmd-1', 'fp-1'].join('\u0000'),
+        },
+        state: PREFERENCE_INGEST_OBSERVATION_STATE,
+        createdAt: 10,
+        updatedAt: 20,
+      },
+    ]);
+
+    handleWebCommand({
+      type: MEMORY_WS.PREF_QUERY,
+      requestId: 'prefs-1',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-1',
+        userId: 'user-1',
+        role: 'user',
+        source: 'server_bridge',
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(listContextObservationsMock).toHaveBeenCalledWith({
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+    });
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.PREF_RESPONSE,
+      requestId: 'prefs-1',
+      featureEnabled: true,
+      records: [expect.objectContaining({
+        id: 'pref-1',
+        userId: 'user-1',
+        text: 'Prefer pnpm',
+        fingerprint: 'fp-1',
+      })],
+    });
+  });
+
+  it('rejects preference create while the preference feature is disabled', async () => {
+    handleWebCommand({ type: MEMORY_WS.PREF_CREATE, requestId: 'pref-create-disabled', text: 'Prefer pnpm' }, serverLink as any);
+    await flushAsync();
+
+    expect(writeContextObservationMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.PREF_CREATE_RESPONSE,
+      requestId: 'pref-create-disabled',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED,
+    });
+  });
+
+  it('refuses preference-delete messages for non-preference observation ids', async () => {
+    enablePreferenceFeature();
+    listContextObservationsMock.mockReturnValueOnce([]);
+
+    handleWebCommand({
+      type: MEMORY_WS.PREF_DELETE,
+      requestId: 'pref-del-1',
+      id: 'obs-non-pref',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-1',
+        userId: 'user-1',
+        role: 'user',
+        source: 'server_bridge',
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(deleteContextObservationMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.PREF_DELETE_RESPONSE,
+      requestId: 'pref-del-1',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND,
+    });
+  });
+
+
+  it('requires expectedFromScope before promoting observations', async () => {
+    enableMemoryFoundationFlags();
+
+    handleWebCommand({
+      type: MEMORY_WS.OBSERVATION_PROMOTE,
+      requestId: 'obs-promote-missing-scope',
+      id: 'obs-1',
+      toScope: 'project_shared',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-1',
+        userId: 'user-1',
+        role: 'workspace_admin',
+        source: 'server_bridge',
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(promoteContextObservationMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE,
+      requestId: 'obs-promote-missing-scope',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_EXPECTED_FROM_SCOPE,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_EXPECTED_FROM_SCOPE,
+    });
+  });
+
+  it('rejects manual markdown ingest without canonical project identity before reading project files', async () => {
+    enableMdIngestFeature();
+
+    handleWebCommand({
+      type: MEMORY_WS.MD_INGEST_RUN,
+      requestId: 'md-no-project-id',
+      projectDir: '/tmp/project',
+      scope: 'personal',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-1',
+        userId: 'user-1',
+        role: 'user',
+        source: 'server_bridge',
+        boundProjects: [{ projectDir: '/tmp/project', canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.MD_INGEST_RUN_RESPONSE,
+      requestId: 'md-no-project-id',
+      success: false,
+      featureEnabled: true,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY,
+    });
   });
 });

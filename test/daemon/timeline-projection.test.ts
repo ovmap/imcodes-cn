@@ -12,6 +12,20 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 const originalDbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
+const PROJECTION_SETTLE_TIMEOUT_MS = 10_000;
+const PROJECTION_SETTLE_INTERVAL_MS = 50;
+const EXPECTED_PROJECTION_EVENT_INDEXES = [
+  'idx_timeline_projection_events_session_streaming_ts',
+  'idx_timeline_projection_events_session_ts',
+  'idx_timeline_projection_events_session_type_ts',
+  'sqlite_autoindex_timeline_projection_events_1',
+];
+
+type TimelineStore = typeof import('../../src/daemon/timeline-store.js').timelineStore;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function makeEvent(sessionId: string, seq: number, type: TimelineEvent['type'], payload: Record<string, unknown>, ts = seq): TimelineEvent {
   return {
@@ -95,6 +109,47 @@ describe('timeline projection', () => {
     }
   }
 
+  async function waitForPreferredSeqs(
+    timelineStore: TimelineStore,
+    sessionId: string,
+    expected: number[],
+    opts: { afterTs?: number; beforeTs?: number; limit?: number },
+  ): Promise<TimelineEvent[]> {
+    const deadline = Date.now() + PROJECTION_SETTLE_TIMEOUT_MS;
+    let lastEvents: TimelineEvent[] = [];
+    while (Date.now() < deadline) {
+      lastEvents = await timelineStore.readPreferred(sessionId, opts);
+      if (lastEvents.map((event) => event.seq).join(',') === expected.join(',')) {
+        return lastEvents;
+      }
+      await sleep(PROJECTION_SETTLE_INTERVAL_MS);
+    }
+    expect(lastEvents.map((event) => event.seq)).toEqual(expected);
+    return lastEvents;
+  }
+
+  async function waitForProjectionEventIndexes(expectedIndexes: string[]): Promise<string[]> {
+    const deadline = Date.now() + PROJECTION_SETTLE_TIMEOUT_MS;
+    let lastIndexes: string[] | null = null;
+    let lastError: unknown = null;
+    while (Date.now() < deadline) {
+      try {
+        const indexes = listProjectionEventIndexes();
+        if (expectedIndexes.every((index) => indexes.includes(index))) {
+          return indexes;
+        }
+        lastIndexes = indexes;
+        lastError = null;
+      } catch (err) {
+        lastError = err;
+      }
+      await sleep(PROJECTION_SETTLE_INTERVAL_MS);
+    }
+    if (lastError) throw lastError;
+    expect(lastIndexes ?? []).toEqual(expect.arrayContaining(expectedIndexes));
+    return lastIndexes ?? [];
+  }
+
   function createLegacyProjectionDbWithoutIndexes(path: string): void {
     mkdirSync(dirname(path), { recursive: true });
     const db = new DatabaseSync(path);
@@ -140,16 +195,17 @@ describe('timeline projection', () => {
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'second' }, 1000));
     timelineStore.append(makeEvent(sessionId, 3, 'assistant.text', { text: 'third' }, 1000));
     timelineStore.append(makeEvent(sessionId, 4, 'assistant.text', { text: 'fourth' }, 1001));
+    await timelineStore.flushSession(sessionId);
 
     await timelineProjection.rebuildSession(sessionId);
 
-    const full = await timelineStore.readPreferred(sessionId, { limit: 10 });
+    const full = await waitForPreferredSeqs(timelineStore, sessionId, [1, 2, 3, 4], { limit: 10 });
     expect(full.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
 
-    const after = await timelineStore.readPreferred(sessionId, { afterTs: 1000, limit: 10 });
+    const after = await waitForPreferredSeqs(timelineStore, sessionId, [4], { afterTs: 1000, limit: 10 });
     expect(after.map((event) => event.seq)).toEqual([4]);
 
-    const before = await timelineStore.readPreferred(sessionId, { beforeTs: 1001, limit: 10 });
+    const before = await waitForPreferredSeqs(timelineStore, sessionId, [1, 2, 3], { beforeTs: 1001, limit: 10 });
     expect(before.map((event) => event.seq)).toEqual([1, 2, 3]);
   });
 
@@ -160,12 +216,8 @@ describe('timeline projection', () => {
 
     await timelineProjection.queryHistory({ sessionId: 'legacy_missing_session', limit: 1 });
 
-    expect(listProjectionEventIndexes()).toEqual(expect.arrayContaining([
-      'idx_timeline_projection_events_session_streaming_ts',
-      'idx_timeline_projection_events_session_ts',
-      'idx_timeline_projection_events_session_type_ts',
-      'sqlite_autoindex_timeline_projection_events_1',
-    ]));
+    expect(await waitForProjectionEventIndexes(EXPECTED_PROJECTION_EVENT_INDEXES))
+      .toEqual(expect.arrayContaining(EXPECTED_PROJECTION_EVENT_INDEXES));
   });
 
   it('returns completed text tail only for non-empty completed text events', async () => {
@@ -176,6 +228,7 @@ describe('timeline projection', () => {
     timelineStore.append(makeEvent(sessionId, 3, 'assistant.text', { text: 'done', streaming: false }, 1002));
     timelineStore.append(makeEvent(sessionId, 4, 'assistant.text', { text: '   ', streaming: false }, 1003));
     timelineStore.append(makeEvent(sessionId, 5, 'tool.call', { tool: 'search' }, 1004));
+    await timelineStore.flushSession(sessionId);
 
     await timelineProjection.rebuildSession(sessionId);
 
@@ -197,6 +250,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
@@ -207,7 +261,7 @@ describe('timeline projection', () => {
     const rebuilt = await timelineStore.readPreferred(sessionId, { limit: 10 });
     expect(rebuilt.map((event) => event.seq)).toEqual([1, 2, 3]);
 
-    timelineStore.truncate(sessionId, 2);
+    await timelineStore.truncate(sessionId, 2);
     await timelineProjection.pruneSessionToAuthoritative(sessionId, 2);
 
     const pruned = await timelineStore.readPreferred(sessionId, { limit: 10 });
@@ -221,6 +275,32 @@ describe('timeline projection', () => {
     expect(explicitlyRebuilt?.map((event) => event.seq)).toEqual([2, 3]);
   });
 
+  it('does not let a stale scheduled rebuild repopulate after delete', async () => {
+    const { timelineProjection, timelineStore } = await loadModules();
+    const sessionId = 'projection_delete_cancels_scheduled_rebuild';
+    const timelineFile = timelineStore.filePath(sessionId);
+    mkdirSync(join(tempHome!, '.imcodes', 'timeline'), { recursive: true });
+
+    timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
+    await timelineProjection.rebuildSession(sessionId);
+
+    appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
+    const stale = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(stale?.map((event) => event.seq)).toEqual([1, 2]);
+
+    await timelineProjection.deleteSession(sessionId);
+    await sleep(100);
+
+    const afterDelete = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(afterDelete?.map((event) => event.seq)).toEqual([]);
+
+    await timelineProjection.rebuildSession(sessionId);
+    const explicitlyRebuilt = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(explicitlyRebuilt?.map((event) => event.seq)).toEqual([1, 2, 3]);
+  });
+
   it('does not parse appended JSONL tails on the read path', async () => {
     const { timelineProjection, timelineStore } = await loadModules();
     const sessionId = 'projection_incremental_tail';
@@ -229,6 +309,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
@@ -249,6 +330,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     const before = readSessionMeta(sessionId);

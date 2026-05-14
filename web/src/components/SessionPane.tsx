@@ -21,6 +21,9 @@ import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -71,9 +74,12 @@ export interface SessionPaneProps {
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
   onSettings?: () => void;
+  onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
   onAfterAction?: () => void;
+  /** Open a file preview in the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
@@ -105,8 +111,10 @@ export function SessionPane({
   onStopProject,
   onRenameSession,
   onSettings,
+  onViewRepo,
   onTransportConfigSaved,
   onAfterAction,
+  onPreviewFile,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
   pendingPrefillText,
@@ -209,18 +217,7 @@ export function SessionPane({
   // working..." text when raw bytes flow (idle detection fires session.state
   // 'running' on any pipe-pane output, not just real agent activity).
   const isAgentlessSession = session.agentType === 'shell' || session.agentType === 'script';
-  const shouldShowFooter = !isAgentlessSession && !!(
-    lastUsage
-    || activeThinkingTs
-    || activeToolCall
-    || statusText
-    || liveSessionState === 'running'
-    || liveSessionState === 'idle'
-    || session.planLabel
-    || session.quotaLabel
-    || session.quotaUsageLabel
-    || session.quotaMeta
-  );
+  const shouldShowFooter = !isAgentlessSession;
 
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 
@@ -271,6 +268,8 @@ export function SessionPane({
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
   const isShellTerminal = terminalVisible && (session.agentType === 'shell' || session.agentType === 'script');
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(session, detectedModel, lastUsage?.model);
+  const effectiveDetectedModel = detectedModel ?? legacyCodexModel ?? undefined;
 
   useEffect(() => {
     if (!terminalVisible || !connected || !ws) return;
@@ -313,6 +312,8 @@ export function SessionPane({
           sessionState={session.state}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
+          onViewRepo={onViewRepo}
+          onPreviewFile={onPreviewFile}
           ws={connected ? ws : null}
           serverId={serverId}
           onQuote={addQuote}
@@ -328,7 +329,7 @@ export function SessionPane({
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={session.agentType}
-          modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined)}
+          modelOverride={resolveEffectiveSessionModel(session, effectiveDetectedModel, lastUsage?.model)}
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
@@ -385,7 +386,7 @@ export function SessionPane({
           onTransportConfigSaved={onTransportConfigSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}
-          detectedModel={detectedModel}
+          detectedModel={effectiveDetectedModel}
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
           mobileFileBrowserOpen={mobileFileBrowserOpen}

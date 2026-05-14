@@ -6,6 +6,11 @@ import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionCompactCommandText,
+  shouldResetTransportPreferenceContextForSessionControl,
+} from '../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
   SharedContextDispatchError,
@@ -32,6 +37,7 @@ import {
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -40,7 +46,10 @@ import { incrementCounter } from '../util/metrics.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
+  /** User-visible task text, without daemon-rendered memory/context preambles. */
   text: string;
+  /** Provider-visible per-turn context rendered through the shared context preamble path. */
+  messagePreamble?: string;
   attachments?: TransportAttachment[];
 }
 
@@ -116,6 +125,10 @@ function withTimeoutOutcome<T>(
   });
 }
 
+function isTransportSlashControl(message: string | undefined): boolean {
+  return message?.trim().startsWith('/') === true;
+}
+
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
  *
@@ -152,9 +165,15 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _contextSharedPolicyOverride: SharedScopePolicyOverride | undefined;
   private _contextAuthoredContextLanguage: string | undefined;
   private _contextAuthoredContextFilePath: string | undefined;
+  private _projectDir: string | undefined;
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
   private _startupMemoryTimelineEmitted = false;
   private _startupMemoryInjected = false;
+  /** Last provider-visible preference context block injected into this provider conversation.
+   *  Preferences are stable session context, not per-turn recall; repeat injection
+   *  bloats SDK prompt windows and can trigger provider auto-compaction. */
+  private _lastInjectedPreferenceContextSignature: string | null = null;
+  private _preferenceContextInjectionAttempt: { previous: string | null } | null = null;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
@@ -191,6 +210,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
+        if (isTransportCompactionCompletion(message)) {
+          this._lastInjectedPreferenceContextSignature = null;
+        }
         this._sending = false;
         this._history.push(message);
         this._activeTurn?.resolve();
@@ -292,6 +314,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._systemPrompt = config.systemPrompt;
+    this._projectDir = config.cwd;
     this._agentId = config.agentId;
     this._effort = config.effort;
     this.applyContextBootstrap({
@@ -329,14 +352,24 @@ export class TransportSessionRuntime implements SessionRuntime {
    *
    * Returns 'sent' if dispatched immediately, 'queued' if enqueued.
    */
-  send(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): 'sent' | 'queued' {
+  send(
+    message: string,
+    clientMessageId?: string,
+    attachments?: TransportAttachment[],
+    messagePreamble?: string,
+  ): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    if (isSessionCompactCommandText(message) && this.provider.capabilities.compact?.execution === 'unsupported') {
+      const reason = this.provider.capabilities.compact.reason?.trim();
+      throw new Error(reason || `${this.provider.id} does not support /compact`);
     }
 
     const entry: PendingTransportMessage = {
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
+      ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
     };
 
@@ -345,7 +378,28 @@ export class TransportSessionRuntime implements SessionRuntime {
       return 'queued';
     }
 
-    this._dispatchTurn(message, entry.clientMessageId, attachments, [entry]);
+    // N-R8 defense-in-depth (audit 0419d1ac-1f4) — wrap direct dispatch so a
+    // synchronous prologue throw inside `_dispatchTurn` (e.g. some future
+    // listener regression in `setStatus → _onStatusChange`) cannot leave
+    // `_sending` true with no in-flight turn. After C1b isolates
+    // `setStatus`, this path's sync prologue rarely throws, but the
+    // exception path must reset state and rethrow so the caller's error
+    // handling (`command-handler.ts` send try/catch) emits the proper
+    // error ack instead of silently looking like a successful send.
+    try {
+      this._dispatchTurn(message, entry.clientMessageId, attachments, [entry]);
+    } catch (err) {
+      logger.error(
+        { err, providerSessionId: this._providerSessionId, clientMessageId: entry.clientMessageId },
+        'runtime.send: _dispatchTurn synchronous prologue threw — rethrowing for caller error path',
+      );
+      // _dispatchTurn may have partially advanced state before throwing.
+      // Reset so the runtime is usable for the next send.
+      this._sending = false;
+      this._activeTurn = null;
+      this._activeDispatchEntries = [];
+      throw err;
+    }
     return 'sent';
   }
 
@@ -355,6 +409,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
+    entry.messagePreamble = undefined;
     return true;
   }
 
@@ -404,7 +459,23 @@ export class TransportSessionRuntime implements SessionRuntime {
   private setStatus(status: AgentStatus): void {
     if (this._status === status) return;
     this._status = status;
-    this._onStatusChange?.(status);
+    if (!this._onStatusChange) return;
+    // Cx1 §2 / observer-isolation fix (audit 0419d1ac-1f4) — the status
+    // observer is an external callback (registered by
+    // `wireTransportCallbacks` in session-manager.ts) that synchronously
+    // emits timeline events. State-machine progress MUST NOT depend on
+    // observer success: a throwing listener used to propagate through
+    // `setStatus` and abort `_dispatchTurn`'s sync prologue (N-R7),
+    // leaving runtime wedged. Catch + warn; never let observer exceptions
+    // tear down the state machine.
+    try {
+      this._onStatusChange(status);
+    } catch (err) {
+      logger.warn(
+        { err, providerSessionId: this._providerSessionId, status },
+        'setStatus: onStatusChange listener threw',
+      );
+    }
   }
 
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
@@ -441,8 +512,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
 
+    if (shouldResetTransportPreferenceContextForSessionControl(message)) {
+      this._lastInjectedPreferenceContextSignature = null;
+    }
+
     void (async () => {
       await this.refreshContextBootstrap({ phase: 'dispatch' });
+      const isSlashControl = isTransportSlashControl(message);
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
         remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -450,17 +526,27 @@ export class TransportSessionRuntime implements SessionRuntime {
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
       }).authority;
-      const startupMemory = this._startupMemory ?? (
+      const startupMemory = isSlashControl ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-          ? buildTransportStartupMemory(this._contextNamespace)
+          ? buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
-      );
-      const memoryRecallResult = await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
+      ));
+      const memoryRecallResult = isSlashControl
+        ? {
+            artifact: null,
+            statusPayload: buildMemoryContextStatusPayload(message.trim().slice(0, 200), 'skipped_control_message', 'message', {
+              runtimeFamily: 'transport',
+              authoritySource: authority.authoritySource,
+              sourceKind: 'local_processed',
+            }),
+          }
+        : await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
       const memoryRecall = memoryRecallResult.artifact;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
-        description: this._description,
-        systemPrompt: this._systemPrompt,
+        messagePreamble: isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message),
+        description: isSlashControl ? undefined : this._description,
+        systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,
@@ -468,13 +554,14 @@ export class TransportSessionRuntime implements SessionRuntime {
         localProcessedFreshness: this._contextLocalProcessedFreshness,
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
-        authoredContextRepository: this.resolveAuthoredContextRepository(),
-        authoredContextLanguage: this._contextAuthoredContextLanguage,
-        authoredContextFilePath: this._contextAuthoredContextFilePath,
+        authoredContextRepository: isSlashControl ? undefined : this.resolveAuthoredContextRepository(),
+        authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
+        authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
         resolveAuthoredContext: (input) => {
+          if (isSlashControl) return Promise.resolve([]);
           if (!input.namespace) return Promise.resolve([]);
           return resolveRuntimeAuthoredContext(input.namespace, {
             language: input.authoredContextLanguage,
@@ -492,6 +579,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       } else if (memoryRecallResult.statusPayload) {
         this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
       }
+      this._preferenceContextInjectionAttempt = null;
       if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
         this._startupMemoryInjected = true;
         // Emit the "Historical context · injected" timeline card at the
@@ -513,6 +601,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Only handle if the provider didn't already fire onError callback.
         // Shared-context dispatch denial is surfaced here as a send failure
         // because the outer runtime contract is still send-oriented.
+        if (this._preferenceContextInjectionAttempt) {
+          this._lastInjectedPreferenceContextSignature = this._preferenceContextInjectionAttempt.previous;
+          this._preferenceContextInjectionAttempt = null;
+        }
         if (!this._sending || !this._activeTurn) return;
         this.setStatus('error');
         this._sending = false;
@@ -546,14 +638,94 @@ export class TransportSessionRuntime implements SessionRuntime {
     const messages = this._pendingMessages.splice(0);
     const merged = messages.map((entry) => entry.text).join('\n\n');
     const attachments = messages.flatMap((entry) => entry.attachments ?? []);
-    this._onDrain?.(messages, merged, messages.length);
-    this._dispatchTurn(
-      merged,
-      messages.length === 1 ? messages[0]?.clientMessageId : undefined,
-      attachments.length > 0 ? attachments : undefined,
-      messages,
-    );
+    // N1 defensive fix (audit f395d49c-78c) — set `_sending=true` BEFORE
+    // calling `_onDrain` so any synchronous re-entrant `runtime.send` from
+    // an onDrain listener queues into `_pendingMessages` instead of
+    // initiating a parallel dispatch.
+    this._sending = true;
+    // N-R1 fix (audit 0419d1ac-1f4) — isolate `_onDrain` so an observer
+    // exception does NOT skip `_dispatchTurn`. Before this fix, the
+    // sequence `_sending=true` → `_onDrain throws` → propagation aborted
+    // `_dispatchTurn` AND left `_sending` permanently true with
+    // `_pendingMessages` already spliced empty — runtime stuck forever,
+    // user-visible as bug 2 "bot stays asleep".
+    try {
+      this._onDrain?.(messages, merged, messages.length);
+    } catch (err) {
+      logger.warn(
+        { err, providerSessionId: this._providerSessionId, count: messages.length },
+        '_drainPending: onDrain listener threw',
+      );
+    }
+    // N-R7 fix (audit 0419d1ac-1f4) — `_dispatchTurn` synchronous prologue
+    // (`_history.push`, `setStatus`, `_activeTurn` setup) can in principle
+    // throw via the `setStatus → _onStatusChange → timelineEmitter.emit`
+    // chain. After C1b isolates `setStatus`, this becomes much harder to
+    // trigger, but defense-in-depth: if the sync prologue ever throws,
+    // we MUST reset `_sending` and surface an error status, otherwise the
+    // runtime is wedged at `_sending=true` with no in-flight turn.
+    try {
+      this._dispatchTurn(
+        merged,
+        messages.length === 1 ? messages[0]?.clientMessageId : undefined,
+        attachments.length > 0 ? attachments : undefined,
+        messages,
+      );
+    } catch (err) {
+      logger.error(
+        { err, providerSessionId: this._providerSessionId, count: messages.length },
+        '_drainPending: _dispatchTurn synchronous prologue threw — resetting runtime state',
+      );
+      this._sending = false;
+      this._activeTurn = null;
+      this._activeDispatchEntries = [];
+      // Last-resort status update; `setStatus` itself is isolated post-C1b
+      // but wrap defensively in case future code regresses that contract.
+      try { this.setStatus('error'); } catch { /* swallow */ }
+      // Note: `messages` are NOT restored to `_pendingMessages`. Restoring
+      // would create a tight retry loop against the same failing path.
+      // The user must resend; the error status notifies them.
+    }
     return true;
+  }
+
+  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string): string | undefined {
+    if (!entries || entries.length === 0) return undefined;
+    const seen = new Set<string>();
+    const parts: string[] = [];
+    const isControlMessage = userMessage?.trim().startsWith('/') === true;
+    if (userMessage && shouldResetTransportPreferenceContextForSessionControl(userMessage)) {
+      // The compact control command must stay raw, and the next real turn
+      // should re-seed stable preferences because the provider may have
+      // discarded prior context during compaction.
+      this._lastInjectedPreferenceContextSignature = null;
+    }
+    for (const entry of entries) {
+      const preamble = entry.messagePreamble?.trim();
+      if (!preamble) continue;
+      const filtered = this.filterOneShotPreferenceContext(preamble, isControlMessage);
+      if (!filtered || seen.has(filtered)) continue;
+      seen.add(filtered);
+      parts.push(filtered);
+    }
+    return parts.join('\n\n') || undefined;
+  }
+
+  private filterOneShotPreferenceContext(preamble: string, isControlMessage: boolean): string | undefined {
+    const extracted = extractPreferenceContextBlocks(preamble);
+    if (extracted.blocks.length === 0) return preamble;
+    const signature = normalizePreferenceContextSignature(extracted.blocks);
+    if (isControlMessage) return extracted.withoutBlocks || undefined;
+    if (signature && signature === this._lastInjectedPreferenceContextSignature) {
+      return extracted.withoutBlocks || undefined;
+    }
+    if (signature) {
+      this._preferenceContextInjectionAttempt ??= {
+        previous: this._lastInjectedPreferenceContextSignature,
+      };
+      this._lastInjectedPreferenceContextSignature = signature;
+    }
+    return preamble;
   }
 
   private async refreshContextBootstrap(options?: {
@@ -901,4 +1073,50 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
     createdAt: item.createdAt,
     ...(typeof item.updatedAt === 'number' ? { updatedAt: item.updatedAt } : {}),
   };
+}
+
+function extractPreferenceContextBlocks(text: string): { blocks: string[]; withoutBlocks: string } {
+  const blocks: string[] = [];
+  const retained: string[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const start = text.indexOf(PREFERENCE_CONTEXT_START, cursor);
+    if (start < 0) {
+      retained.push(text.slice(cursor));
+      break;
+    }
+    const end = text.indexOf(PREFERENCE_CONTEXT_END, start + PREFERENCE_CONTEXT_START.length);
+    if (end < 0) {
+      retained.push(text.slice(cursor));
+      break;
+    }
+    retained.push(text.slice(cursor, start));
+    const blockEnd = end + PREFERENCE_CONTEXT_END.length;
+    blocks.push(text.slice(start, blockEnd).trim());
+    cursor = blockEnd;
+  }
+  return {
+    blocks,
+    withoutBlocks: retained.join('').replace(/\n{3,}/g, '\n\n').trim(),
+  };
+}
+
+function normalizePreferenceContextSignature(blocks: readonly string[]): string {
+  return blocks.map((block) => block.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
+}
+
+function isTransportCompactionCompletion(message: AgentMessage): boolean {
+  const metadata = message.metadata;
+  const event = typeof metadata === 'object' && metadata !== null
+    ? (metadata as Record<string, unknown>).event
+    : undefined;
+  return message.kind === 'system'
+    && message.role === 'system'
+    && (
+      (typeof metadata === 'object'
+        && metadata !== null
+        && (metadata as Record<string, unknown>)[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact')
+      || event === 'thread/compacted'
+      || event === 'session.history.compact'
+    );
 }
